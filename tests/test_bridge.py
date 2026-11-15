@@ -14,6 +14,9 @@ _spec = importlib.util.spec_from_file_location(
     "buddy_bridge", os.path.join(os.path.dirname(__file__), "..", "tools", "buddy_bridge.py"))
 bridge = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bridge)
+# These tests describe the macOS paths (afplay, lsappinfo, /dev/cu.usbmodem*), whatever machine runs them;
+# test_windows.py switches IS_WIN on where it tests the Windows ones.
+bridge.IS_WIN = False
 
 # a fixed moment at local noon, so "night" never kicks in by accident
 NOON = time.mktime(time.struct_time((2026, 11, 11, 12, 0, 0, 0, 0, -1)))
@@ -46,7 +49,8 @@ class Clock:
 class BridgeTest(unittest.TestCase):
     def setUp(self):
         for f in os.listdir(HOME):
-            os.remove(os.path.join(HOME, f))
+            if not f.startswith("bridge.log"):        # the bridge's own log stays open (Windows won't delete it)
+                os.remove(os.path.join(HOME, f))
         self.clock = Clock(NOON)
         p = mock.patch.object(bridge.time, "time", self.clock)
         p.start(); self.addCleanup(p.stop)

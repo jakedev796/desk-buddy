@@ -40,11 +40,17 @@ goes its own way after a minute and shows he's not connected. Session state is k
 Extras for debugging:  GET /status   POST /cmd  (body: a raw command such as "s done")
                        GET /sound    POST /sound (body: on | off | toggle | play <moment>)
                        (play tap_<gag>_<mood> plays a gag's sound, e.g. play tap_shock_idle)
-Install as a login item with tools/install_bridge.sh.
+Install as a login item with tools/install_bridge.sh (macOS) or tools/windows/install.ps1 (Windows).
+
+Windows: the same bridge, with Windows stand-ins for the Mac-only parts (all behind IS_WIN, imported only
+there): the board is found by its USB-serial chip's ID, the Claude app in front comes from the foreground
+window, sounds play through winsound, and usage also comes from the desktop app's own usage history
+(class AppUsageFile), since the desktop app has no status line.
 """
 import glob, http.server, json, logging, logging.handlers, os, random, re, subprocess, sys, threading, time, wave
 import serial
 
+IS_WIN = sys.platform == "win32"         # Windows stand-ins for the Mac-only parts (see the docstring)
 HTTP_PORT = 47823
 HOME = os.environ.get("DESKBUDDY_HOME") or os.path.expanduser("~/.desk-buddy")   # tests point this elsewhere
 NIGHT_START, NIGHT_END = 0, 8           # local hours: night (deep sleep under the blanket) is midnight to 8am
@@ -103,6 +109,7 @@ FIDGET_EVERY = (5 * 60, 15 * 60)
 # that (his way in from the mood is padded to 12 frames at 24 fps); the night startle has no way in.
 GAG_LEAD = 0.5
 AFPLAY_LAG = 0.05                       # afplay takes a moment to start making sound
+WINSOUND_LAG = 0.02                     # ...winsound (Windows) less so
 # Heartbeat: "h <seconds since local midnight>" every HEARTBEAT_EVERY. If the board hears nothing
 # for a minute (bridge crashed, Mac asleep, USB power only) he goes his own way: idle and fidgeting,
 # asleep at night, with a little unplugged-cable mark. The heartbeat also tells him the time.
@@ -119,16 +126,16 @@ PLANE_FRESH = 10 * 60                   # older messages (the bridge was down, t
 os.makedirs(HOME, exist_ok=True)
 log = logging.getLogger("bridge")
 log.setLevel(logging.INFO)
-_h = logging.handlers.RotatingFileHandler(os.path.join(HOME, "bridge.log"), maxBytes=500_000, backupCount=2)
+_h = logging.handlers.RotatingFileHandler(os.path.join(HOME, "bridge.log"), maxBytes=500_000, backupCount=2, encoding="utf-8")
 _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 log.addHandler(_h)
-if sys.stderr.isatty():          # under launchd stderr is bridge.out, which only needs crashes
+if sys.stderr and sys.stderr.isatty():   # under launchd stderr is bridge.out (only crashes); under pythonw there's none
     log.addHandler(logging.StreamHandler())
 
 
 def read_config():
     try:
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -151,8 +158,13 @@ class Device:
     def connected(self):
         return self.ser is not None
 
+    USB_ID = (0x1A86, 0x55D3)          # the board's WCH CH343 USB-serial chip (how Windows finds it)
+
     @staticmethod
     def usb_ports():
+        if IS_WIN:
+            from serial.tools import list_ports
+            return sorted(p.device for p in list_ports.comports() if (p.vid, p.pid) == Device.USB_ID)
         return sorted(glob.glob("/dev/cu.usbmodem*"))
 
     def _targets(self):
@@ -279,7 +291,8 @@ class Calendar:
 
     def refresh(self):
         try:
-            cfg = json.load(open(CONFIG_FILE))
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
         except Exception:
             return
         url = (cfg.get("calendar_ics") or "").strip()
@@ -309,7 +322,7 @@ class Calendar:
             out.append({"start": st.timestamp(), "end": en.timestamp(), "title": str(e.get("SUMMARY", ""))[:80]})
         out.sort(key=lambda m: m["start"])
         tmp = MEETINGS_FILE + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(out, f)
         os.replace(tmp, MEETINGS_FILE)
         log.info("calendar: %d upcoming meetings", len(out))
@@ -321,18 +334,19 @@ class Calendar:
 # CLAUDE_CONFIG_DIR=~/.claude-<name>. Personal is the plain default everywhere in the bridge; another
 # account's Chat/Cowork sessions are "app:<account>:<name>" and its usage keys "<account>:five_hour".
 PERSONAL = "personal"
-APP_SUPPORT = os.path.expanduser("~/Library/Application Support")
+# Windows: the app's data folders (Claude, Claude-Work ...) live in %APPDATA%, its logs in %LOCALAPPDATA%\Claude\logs
+APP_SUPPORT = os.environ.get("APPDATA", "") if IS_WIN else os.path.expanduser("~/Library/Application Support")
 
 
 def account_of_config(path):
     """The account behind a Claude Code path, e.g. a hook's transcript_path (~/.claude-work/... -> work)."""
-    m = re.search(r"/\.claude-([^/]+)/", path or "")
+    m = re.search(r"[/\\]\.claude-([^/\\]+)[/\\]", path or "")   # either slash, so Windows paths too
     return m.group(1).lower() if m else PERSONAL
 
 
 def account_of_data_dir(path):
     """The account behind a Claude app data folder (.../Application Support/Claude-Work -> work)."""
-    name = os.path.basename((path or "").rstrip("/"))
+    name = os.path.basename((path or "").rstrip("/\\"))
     return name[len("Claude-"):].lower() if name.startswith("Claude-") else PERSONAL
 
 
@@ -344,6 +358,43 @@ def account_of_pid(pid):
         return None
     m = re.search(r"--user-data-dir=(.+?)(?= --|$)", cmd.strip())
     return account_of_data_dir(m.group(1)) if m else PERSONAL
+
+
+def win_foreground():
+    """Windows: (pid, exe path) of the app whose window is in front, or (None, "") when there's none
+    (locked, or a disconnected Remote Desktop session)."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None, ""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    try:
+        import psutil
+        return pid.value, psutil.Process(pid.value).exe()
+    except Exception:
+        return pid.value or None, ""
+
+
+def is_claude_app(exe):
+    """Is this exe the Claude desktop app (Claude.exe), not the Claude Code CLI (also claude.exe, under claude-code)?"""
+    e = (exe or "").replace("/", "\\").lower()
+    return e.rsplit("\\", 1)[-1] == "claude.exe" and "\\claude-code\\" not in e
+
+
+def account_of_pid_win(pid):
+    """Windows: which account a running copy of the Claude app belongs to (from its --user-data-dir)."""
+    try:
+        import psutil
+        args = psutil.Process(pid).cmdline()
+    except Exception:
+        return None
+    for a in args:
+        if a.startswith("--user-data-dir="):
+            return account_of_data_dir(a.split("=", 1)[1].strip('"'))
+    return PERSONAL
 
 
 class Focus:
@@ -358,7 +409,7 @@ class Focus:
     which copy it came from (its file is in that copy's data folder); "null" (no Code session
     showing) doesn't, so it's put down to the copy in front, or the one that was in front last."""
 
-    LOGS = os.path.expanduser("~/Library/Logs/Claude")
+    LOGS = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Claude", "logs") if IS_WIN else os.path.expanduser("~/Library/Logs/Claude")
     SUPPORT = APP_SUPPORT                 # Claude/ (personal), Claude-Work/ ... each with claude-code-sessions/
     FOCUS_RE = re.compile(r"setFocusedSession: sessionId=(local_[0-9a-f-]+|null)")
 
@@ -384,7 +435,7 @@ class Focus:
             path = files[0]
             acct = account_of_data_dir(path[:path.index(os.sep + "claude-code-sessions" + os.sep)])
             try:
-                with open(path) as f: self._map[local] = (acct, json.load(f).get("cliSessionId"))
+                with open(path, encoding="utf-8") as f: self._map[local] = (acct, json.load(f).get("cliSessionId"))
             except Exception: return acct, None
         return self._map[local]
 
@@ -433,21 +484,96 @@ class Focus:
             self._pos = size
             if hits: self._apply(hits[-1])
 
+    def _front_account_win(self, pid, exe):
+        """Windows: the Claude copy in front, from the foreground window's process, or None."""
+        if not pid or not is_claude_app(exe):
+            return None
+        if pid not in self._pids:
+            if len(self._pids) > 50: self._pids.clear()
+            self._pids[pid] = account_of_pid_win(pid)
+        return self._pids[pid] or PERSONAL
+
+    def front_now(self):
+        """The Claude copy in front right now (None: another app is)."""
+        if IS_WIN:
+            return self._front_account_win(*win_foreground())
+        info = subprocess.run(["lsappinfo", "info", "-only", "bundleid", "-only", "pid", subprocess.run(["lsappinfo", "front"], capture_output=True, text=True).stdout.strip()],
+                              capture_output=True, text=True, timeout=2).stdout
+        return self._front_account(info)
+
     def _run(self):
-        import subprocess
         while True:
             try:
-                info = subprocess.run(["lsappinfo", "info", "-only", "bundleid", "-only", "pid", subprocess.run(["lsappinfo", "front"], capture_output=True, text=True).stdout.strip()],
-                                      capture_output=True, text=True, timeout=2).stdout
-                self.set_front(self._front_account(info))
+                self.set_front(self.front_now())
                 self._poll_log()
             except Exception as e:
                 log.info("focus check failed: %s", e)
             time.sleep(1.5)
 
 
+class WinSound:
+    """Windows stand-in for an afplay process: plays a WAV through winsound (asynchronously) with the same
+    poll()/terminate() an afplay Popen has. winsound has no volume, so a volume other than 1 plays a scaled
+    copy of the WAV (16-bit only; others play as they are), cached under ~/.desk-buddy/cache."""
+
+    def __init__(self, path, volume):
+        import winsound
+        self.winsound = winsound
+        try:
+            with wave.open(path) as w:
+                length = w.getnframes() / w.getframerate()
+        except Exception:
+            length = 5.0
+        self.until = time.time() + length
+        winsound.PlaySound(self.scaled(path, volume), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+
+    @staticmethod
+    def scaled(path, volume):
+        try: volume = float(volume)
+        except (TypeError, ValueError): volume = 1.0
+        if abs(volume - 1.0) < 0.01:
+            return path
+        import array
+        out_dir = os.path.join(HOME, "cache", "sounds")
+        out = os.path.join(out_dir, "%s-v%.2f.wav" % (os.path.splitext(os.path.basename(path))[0], volume))
+        try:
+            if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path):
+                return out
+            with wave.open(path) as w:
+                params, frames = w.getparams(), w.readframes(w.getnframes())
+            if params.sampwidth != 2:
+                return path
+            a = array.array("h", frames)
+            if sys.byteorder == "big": a.byteswap()
+            a = array.array("h", (max(-32768, min(32767, int(v * volume))) for v in a))
+            if sys.byteorder == "big": a.byteswap()
+            os.makedirs(out_dir, exist_ok=True)
+            tmp = out + ".tmp"
+            with wave.open(tmp, "wb") as w:
+                w.setparams(params); w.writeframes(a.tobytes())
+            os.replace(tmp, out)
+            return out
+        except Exception as e:
+            log.info("can't scale %s: %s", path, e)
+            return path
+
+    def poll(self):
+        return None if time.time() < self.until else 0
+
+    def terminate(self):
+        self.winsound.PlaySound(None, 0)          # stops whatever winsound is playing
+        self.until = 0
+
+
+def start_sound(path, volume):
+    """Start playing a WAV: afplay on the Mac, winsound on Windows. Returns something with poll()/terminate()."""
+    if IS_WIN:
+        return WinSound(path, volume)
+    return subprocess.Popen(["afplay", "-v", str(volume), path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 class Sounds:
-    """Plays Lump's voice through afplay. Settings are re-read whenever sounds.json changes, so
+    """Plays Lump's voice through afplay (winsound on Windows). Settings are re-read whenever sounds.json changes, so
     flipping "enabled" (Claude Switcher, POST /sound, or by hand) takes effect immediately.
       {"enabled": true, "volume": 1.0, "quiet_at_night": true,
        "moments": {"needs_you": {"on": true, "pick": ["a", "c"]}, ...}}
@@ -462,7 +588,7 @@ class Sounds:
         try:
             m = os.path.getmtime(SOUNDS_FILE)
             if m != self.mtime:
-                with open(SOUNDS_FILE) as f:
+                with open(SOUNDS_FILE, encoding="utf-8") as f:
                     self.cfg = json.load(f)
                 self.mtime = m
         except FileNotFoundError:
@@ -476,7 +602,7 @@ class Sounds:
             cfg = dict(self.settings())
             cfg["enabled"] = (not cfg.get("enabled", False)) if value == "toggle" else bool(value)
             tmp = SOUNDS_FILE + ".tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
             os.replace(tmp, SOUNDS_FILE)
             log.info("sounds %s", "on" if cfg["enabled"] else "off")
@@ -509,8 +635,7 @@ class Sounds:
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()                         # one voice at a time
             try:
-                self.proc = subprocess.Popen(["afplay", "-v", str(cfg.get("volume", 1.0)), path],
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.proc = start_sound(path, cfg.get("volume", 1.0))
             except Exception as e:
                 log.info("afplay failed: %s", e); return False
             self.last_any = self.last_at[moment] = now
@@ -537,7 +662,7 @@ class Sounds:
                     length = w.getnframes() / w.getframerate()
             except Exception:
                 length = 5.0
-            delay = max(0.0, (0 if gag == "startle" else GAG_LEAD) - AFPLAY_LAG)
+            delay = max(0.0, (0 if gag == "startle" else GAG_LEAD) - (WINSOUND_LAG if IS_WIN else AFPLAY_LAG))
             if self.gag_timer:
                 self.gag_timer.cancel()
             self.gag_until = time.time() + delay + length
@@ -552,7 +677,7 @@ class Sounds:
             if self.proc and self.proc.poll() is None:
                 self.proc.terminate()                         # one voice at a time
             try:
-                self.proc = subprocess.Popen(["afplay", "-v", str(volume), path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.proc = start_sound(path, volume)
             except Exception as e:
                 log.info("afplay failed: %s", e); return
             self.last_any = time.time()
@@ -663,14 +788,14 @@ class Buddy:
         if data == self.saved:
             return
         tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(data)
         os.replace(tmp, STATE_FILE)
         self.saved = data
 
     def load_state(self):
         try:
-            with open(STATE_FILE) as f:
+            with open(STATE_FILE, encoding="utf-8") as f:
                 st = json.load(f)
         except FileNotFoundError:
             return
@@ -939,7 +1064,7 @@ class Buddy:
 
     def next_meeting(self, now):
         try:
-            with open(MEETINGS_FILE) as f:
+            with open(MEETINGS_FILE, encoding="utf-8") as f:
                 ms = json.load(f)
         except Exception:
             return None
@@ -1021,9 +1146,11 @@ class Buddy:
                 return meeting_blend(base, round((1 - until / MEETING_LEAD) * 40) / 40)
         return base
 
-    def set_usage(self, rl, source="statusline", account=PERSONAL):
+    def set_usage(self, rl, source="statusline", account=PERSONAL, at=None):
         """Usage readings from the Claude Code status line, or the Claude app's usage ring. Each account
-        has its own limits (keys "five_hour", "work:five_hour", ...); the colour follows the busiest."""
+        has its own limits (keys "five_hour", "work:five_hour", ...); the colour follows the busiest.
+        at: when the reading was taken, if that's not now (the desktop app's usage history): it then never
+        replaces a reading taken after it."""
         changed = False
         with self.lock:
             for window in ("five_hour", "seven_day"):
@@ -1031,8 +1158,10 @@ class Buddy:
                 w = (rl or {}).get(window)
                 if isinstance(w, dict) and w.get("used_percentage") is not None:
                     old = self.usage.get(key, {})
+                    if at is not None and old.get("t", 0) > at:
+                        continue                                   # we already have a fresher reading
                     resets = w.get("resets_at") or (old.get("resets") if source == "app" else None)
-                    new = {"pct": float(w["used_percentage"]), "resets": resets, "t": time.time(), "source": source}
+                    new = {"pct": float(w["used_percentage"]), "resets": resets, "t": time.time() if at is None else at, "source": source}
                     changed |= old.get("pct") != new["pct"]
                     self.usage[key] = new
         if changed:
@@ -1318,6 +1447,8 @@ class SlackWatch:
         """Is Slack the app you're using right now? (Then a plane is just noise, and a VIP message you're
         reading as it lands shouldn't get the whole letter routine.)"""
         try:
+            if IS_WIN:
+                return win_foreground()[1].replace("/", "\\").lower().rsplit("\\", 1)[-1] == "slack.exe"
             asn = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True, timeout=2).stdout.strip()
             out = subprocess.run(["lsappinfo", "info", "-only", "bundleID", asn], capture_output=True, text=True, timeout=2).stdout
             return "com.tinyspeck.slackmacgap" in out
@@ -1434,6 +1565,48 @@ class SlackWatch:
             self.buddy.slack_plane(plane[1], plane[0])
 
 
+class AppUsageFile:
+    """Windows: usage from the Claude desktop app's own history file (plan-usage-history.json in each copy's
+    data folder: {"samples": [{"t": ms, "org": ..., "u": {"fh": 5-hour %, "sd": weekly %}}]}), written about
+    every 15 minutes. The desktop app has no status line, so this is how his colour follows your limits there.
+    Only a sample newer than the last one taken is fed, stamped with its own time, so a fresher status-line
+    reading (from a CLI session) is never overwritten by it."""
+
+    EVERY = 60
+    MAX_AGE = 30 * 60                     # an older newest sample means the app isn't running: ignore it
+    NAME = "plan-usage-history.json"
+
+    def __init__(self, buddy, support=None, start=True):
+        self.buddy, self.support, self.fed = buddy, support or APP_SUPPORT, {}
+        if start:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            try: self.poll(time.time())
+            except Exception as e: log.info("app usage check failed: %s", e)
+            time.sleep(self.EVERY)
+
+    def poll(self, now):
+        for path in glob.glob(os.path.join(glob.escape(self.support), "Claude*", self.NAME)):
+            acct = account_of_data_dir(os.path.dirname(path))
+            try:
+                with open(path, encoding="utf-8") as f:
+                    samples = json.load(f).get("samples") or []
+            except Exception as e:
+                log.info("can't read %s: %s", path, e); continue
+            good = [s for s in samples if isinstance(s, dict) and isinstance(s.get("t"), (int, float)) and isinstance(s.get("u"), dict)]
+            if not good:
+                continue
+            s = max(good, key=lambda s: s["t"])
+            t = s["t"] / 1000
+            if now - t > self.MAX_AGE or t <= self.fed.get(acct, 0):
+                continue
+            self.fed[acct] = t
+            rl = {w: {"used_percentage": s["u"][k]} for w, k in (("five_hour", "fh"), ("seven_day", "sd")) if isinstance(s["u"].get(k), (int, float))}
+            self.buddy.set_usage(rl, source="app", account=acct, at=t)
+
+
 buddy = None
 
 
@@ -1497,5 +1670,7 @@ if __name__ == "__main__":
     buddy.app = AppPages(buddy)
     buddy.calendar = Calendar()
     buddy.slack = SlackWatch(buddy)
+    if IS_WIN:
+        buddy.app_usage = AppUsageFile(buddy)
     log.info("desk-buddy bridge listening on 127.0.0.1:%d", HTTP_PORT)
     http.server.ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), Handler).serve_forever()
