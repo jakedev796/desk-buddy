@@ -161,6 +161,30 @@ class PreviewIsWhatHeShows(unittest.TestCase):
             self.assertEqual(b.status()["shown"], "alert")
             b.update(force=True)                             # Back to live (POST /resync)
             self.assertEqual(b.status()["shown"], b.status()["mood"])
+class RemoteLumpInTheWindow(ApiTest):
+    def test_relay_state_never_includes_the_token(self):
+        self.assertFalse(self.api.state()["relay"]["set_up"])
+        control.new_relay_token(self.cfg)
+        s = self.api.state()
+        self.assertTrue(s["relay"]["set_up"])
+        self.assertNotIn(control.read_json(self.cfg)["relay_token"], json.dumps(s))
+
+    def test_copy_goes_to_the_clipboard_from_python(self):
+        self.assertFalse(self.api.copy_relay_token()["ok"])          # not set up
+        control.new_relay_token(self.cfg)
+        tok = control.read_json(self.cfg)["relay_token"]
+        with mock.patch.object(control.subprocess, "run") as run:
+            r = self.api.copy_relay_token()
+        self.assertTrue(r["ok"])
+        self.assertNotIn(tok, json.dumps(r))
+        self.assertEqual(run.call_args[0][0], ["clip"])
+        self.assertEqual(run.call_args[1]["input"], tok.encode("ascii"))
+
+    def test_new_token_replaces_the_old_one(self):
+        control.new_relay_token(self.cfg)
+        old = control.read_json(self.cfg)["relay_token"]
+        self.assertTrue(self.api.renew_relay_token()["ok"])
+        self.assertNotEqual(control.read_json(self.cfg)["relay_token"], old)
 
 
 @unittest.skipUnless(os.path.exists(ART), "needs firmware/data/lump.bin")

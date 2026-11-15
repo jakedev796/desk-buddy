@@ -186,6 +186,10 @@ function render(s) {
   for (const b of document.querySelectorAll(".swatch")) b.classList.toggle("current", b.dataset.hex === s.colour);
   $("colour-pick").value = "#" + s.colour.toLowerCase();
   $("pairing").textContent = s.settings.lump_paired ? "Wi-Fi pairing: set up" : "Wi-Fi pairing: not set up (run tools\\wifi_setup.py with him plugged in)";
+  $("relay-text").textContent = s.relay.set_up
+    ? (s.relay.text || "Set up. Waiting for the bridge to start listening.").replace(/^Remote Lump: /, "").replace(/^./, (m) => m.toUpperCase())
+    : "Not set up. To drive a Lump plugged into another computer, run tools\\windows\\install.ps1 -AllowRelay on this PC.";
+  $("relay-actions").classList.toggle("hidden", !s.relay.set_up);
   if (!formFilled) {
     const f = $("settings-form");
     for (const [k, v] of Object.entries(s.settings)) if (f.elements[k]) f.elements[k].value = v;
@@ -310,6 +314,10 @@ function wire() {
     const res = await api().save_apps(keep);
     toast(res);
     if (res.ok) { appsDraft = null; appsKey = ""; }
+  });
+  $("relay-copy").addEventListener("click", () => act(api().copy_relay_token()));
+  $("relay-new").addEventListener("click", () => {
+    if (confirm("Make a new relay token? The remote Lump disconnects until its computer gets the new one (run install.ps1 -Relay there again).")) act(api().renew_relay_token());
   });
   $("settings-form").addEventListener("submit", async (e) => {
     e.preventDefault();

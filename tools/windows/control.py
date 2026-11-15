@@ -688,7 +688,9 @@ class Api:
                 "settings": {"lump_host": cfg.get("lump_host", ""), "lump_paired": bool(cfg.get("lump_token")),
                              "calendar_ics": cfg.get("calendar_ics", ""), "my_email": cfg.get("my_email", ""),
                              "slack_token": cfg.get("slack_token", ""), "slack_vips": ", ".join(cfg.get("slack_vips") or []),
-                             "slack_vip_minutes": str(cfg.get("slack_vip_minutes") or "")}}
+                             "slack_vip_minutes": str(cfg.get("slack_vip_minutes") or "")},
+                # the remote link: whether it's set up and how it's doing; the token itself never goes to the page
+                "relay": {"set_up": bool(cfg.get("relay_token")), "text": describe_relay(self._bridge.status())}}
 
     def animations(self):
         names = self._bridge.animations() or []
@@ -803,6 +805,20 @@ class Api:
         start = os.path.expanduser("~")
         got = win.create_file_dialog(webview.FOLDER_DIALOG, directory=start)
         return got[0] if got else None
+
+    def copy_relay_token(self):
+        """Put the relay token on the clipboard (Python does it, so the page never sees the token)."""
+        tok = read_json(CONFIG_FILE).get("relay_token")
+        if not tok:
+            return {"ok": False, "message": "the remote link isn't set up (install.ps1 -AllowRelay)"}
+        subprocess.run(["clip"], input=tok.encode("ascii"), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return {"ok": True, "message": "relay token copied: paste it where the relay installer asks for it"}
+
+    def renew_relay_token(self):
+        if not read_json(CONFIG_FILE).get("relay_token"):
+            return {"ok": False, "message": "the remote link isn't set up (install.ps1 -AllowRelay)"}
+        new_relay_token(CONFIG_FILE, replace=True)
+        return {"ok": True, "message": "new relay token made: the relay is disconnected until it has it"}
 
     def set_theme(self, theme):
         update_json(CONFIG_FILE, {"ui_theme": theme if theme in ("dark", "light") else None})
