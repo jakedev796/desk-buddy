@@ -140,6 +140,10 @@ RELAY_RATE, RELAY_BURST = 20, 20        # lines per second from a relay (a bucke
 RELAY_FLOOD, RELAY_FLOOD_SECS = 100, 10  # ...and this many over the limit within this long drops it
 RELAY_EVENT_GAP = 2                     # tap, gag, resync and boot from a relay: each at most once this often
 STATE_FILE = os.path.join(HOME, "state.json")     # sessions etc. survive a bridge restart
+# Stall watchdog (class StallWatch): if the tick loop doesn't come round for this long, every thread's stack goes
+# to stalls.log, so a frozen bridge says where it was stuck.
+STALL_SECS = 15
+STALLS_FILE = os.path.join(HOME, "stalls.log")
 # Slack, polled with your user token (see class SlackWatch). config.json: "slack_token" (xoxp-..., never
 # logged), "slack_vips" (names as Slack shows them), optional "slack_vip_minutes" (how long a letter lasts).
 SLACK_EVERY = 20                        # seconds between polls
@@ -1269,6 +1273,55 @@ def usage_colour(frac):
     return USAGE_STOPS[-1][1]
 
 
+class StallWatch:
+    """Records where the bridge is stuck if it ever freezes. The tick loop re-arms it every second; if a round
+    takes longer than STALL_SECS (a lock held, a call that never returns, or the whole process stuck), Python's
+    faulthandler dumps every thread's stack into stalls.log from its own C-level thread, which works even when
+    no Python code can run. When the loop comes round again, bridge.log notes how long it was stuck."""
+
+    def __init__(self, path=None, secs=None, clock=time.time):
+        import faulthandler
+        self.faulthandler, self.secs, self.clock = faulthandler, secs or STALL_SECS, clock
+        self.path, self.file, self.last, self.stamped = path or STALLS_FILE, None, None, 0.0
+        self._open()
+
+    def _open(self):
+        try:
+            if os.path.getsize(self.path) > 1_000_000:          # keep it small: one older copy
+                os.replace(self.path, self.path + ".1")
+        except OSError:
+            pass
+        try:
+            self.file = open(self.path, "a", encoding="utf-8")
+        except OSError as e:
+            self.file = None
+            log.info("stall watchdog off: can't open %s: %s", self.path, e)
+
+    def arm(self):
+        now = self.clock()
+        if self.last is not None and now - self.last > self.secs:
+            log.info("the bridge was stuck for %.0f s (where: %s)", now - self.last, self.path)
+        self.last = now
+        if not self.file:
+            return
+        if now - self.stamped >= 60:            # a time mark a minute, so a dump can be dated without the file growing fast
+            self.stamped = now
+            if self.file.tell() > 1_000_000:
+                self.faulthandler.cancel_dump_traceback_later()
+                self.file.close()
+                self._open()
+                if not self.file:
+                    return
+            self.file.write(time.strftime("--- %Y-%m-%d %H:%M:%S\n", time.localtime(now)))
+            self.file.flush()
+        self.faulthandler.dump_traceback_later(self.secs, repeat=False, file=self.file)
+
+    def stop(self):
+        self.faulthandler.cancel_dump_traceback_later()
+        if self.file:
+            self.file.close(); self.file = None
+
+
 class Buddy:
     def __init__(self, dev=None, focus=None, sounds=None, start=True):
         self.lock = threading.Lock()
@@ -1759,7 +1812,9 @@ class Buddy:
     def _tick(self):
         # Nothing in here may kill this loop: it drives the board, the heartbeat and saving. (If it
         # did die anyway, the heartbeat would stop and the board would show he's on his own.)
+        watch = StallWatch()
         while True:
+            watch.arm()
             time.sleep(1)
             try: self.tick(time.time())
             except Exception: log.exception("tick failed")
