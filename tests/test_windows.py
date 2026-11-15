@@ -267,6 +267,55 @@ class StatusLineScript(unittest.TestCase):
         self.assertEqual(self.run_it(b"not json").decode("utf-8").strip(), "")
 
 
+def load_tool(name):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(TOOLS, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class WifiSetup(unittest.TestCase):
+    """tools/wifi_setup.py: the Mac path pinned, the Windows one checked."""
+
+    def setUp(self):
+        self.w = load_tool("wifi_setup")
+
+    def test_mac_finds_the_board_and_pauses_the_bridge_as_before(self):
+        with mock.patch.object(self.w, "IS_WIN", False):
+            with mock.patch.object(self.w.glob, "glob", return_value=["/dev/cu.usbmodem1"]) as g:
+                self.assertEqual(self.w.usb_ports(), ["/dev/cu.usbmodem1"])
+            g.assert_called_once_with("/dev/cu.usbmodem*")
+            with mock.patch.object(self.w.os, "getuid", create=True, return_value=501), \
+                 mock.patch.object(self.w.subprocess, "run") as run:
+                self.w.bridge_ctl(start=False)
+                self.w.bridge_ctl(start=True)
+            self.assertEqual(run.call_args_list, [
+                mock.call(["launchctl", "bootout", "gui/501/com.deskbuddy.bridge"], capture_output=True),
+                mock.call(["launchctl", "bootstrap", "gui/501", self.w.BRIDGE_PLIST], capture_output=True)])
+
+    def test_windows_finds_the_board_by_its_usb_chip_and_pauses_the_installed_bridge(self):
+        ports = [types.SimpleNamespace(device="COM3", vid=0x07FD, pid=0x000B), types.SimpleNamespace(device="COM4", vid=0x1A86, pid=0x55D3)]
+        with mock.patch.object(self.w, "IS_WIN", True):
+            with mock.patch("serial.tools.list_ports.comports", return_value=ports):
+                self.assertEqual(self.w.usb_ports(), ["COM4"])
+            with mock.patch.object(self.w.subprocess, "run") as run:
+                self.w.bridge_ctl(start=False)
+            argv = run.call_args[0][0]
+            self.assertEqual(argv[0], "powershell")
+            self.assertTrue(argv[-2].endswith(os.path.join("tools", "windows", "bridge.ps1")))
+            self.assertEqual(argv[-1], "-Stop")
+
+    def test_windows_time_zone_as_a_posix_rule(self):
+        tz = self.w.posix_tz_from_windows
+        self.assertEqual(tz(360, 0, -60, (11, 1, 0, 2), (3, 2, 0, 2)), "STD6DST5,M3.2.0/2,M11.1.0/2")      # US Central
+        self.assertEqual(tz(0, 0, -60, (10, 5, 0, 2), (3, 5, 0, 1)), "STD0DST-1,M3.5.0/1,M10.5.0/2")      # London
+        self.assertEqual(tz(-330, 0, 0, (0, 0, 0, 0), (0, 0, 0, 0)), "STD-5:30")                          # India, no DST
+
+    @unittest.skipUnless(ON_WINDOWS, "reads this PC's time zone")
+    def test_this_pcs_time_zone_reads(self):
+        self.assertRegex(self.w.windows_posix_tz(), r"^STD-?\d")
+
+
 @unittest.skipUnless(ON_WINDOWS, "the Windows install")
 class WindowsInstallHooks(unittest.TestCase):
     OTHER = {"model": "opus", "note": "Lump’s settings 🎉", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}
