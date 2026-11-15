@@ -14,8 +14,14 @@ asks Python for everything through class Api. Without pywebview it falls back to
 tools/windows/install.ps1 installs it as ~/.desk-buddy/control.py and starts it at logon (pythonw, no
 console). Run by hand: ~/.desk-buddy/venv/Scripts/pythonw tools/windows/control.py [--show]
 Needs pywebview, pystray and Pillow (installed by install.ps1).
+
+Remote Lump (Lump plugged into another computer, see tools/lump_relay.py): the left panel shows when he's on
+the remote link and whether his board is plugged in over there; Settings shows whether the remote link is set
+up, copies its token, or makes a new one (which disconnects the relay until it gets the new token). install.ps1
+uses the same token helpers from the command line (--ensure-relay-token, --remove-relay-token, --relay-command),
+none of which ever prints the token.
 """
-import json, os, socket, subprocess, sys, threading, time, urllib.error, urllib.request
+import json, os, secrets, socket, subprocess, sys, threading, time, urllib.error, urllib.request
 
 HOME = os.environ.get("DESKBUDDY_HOME") or os.path.expanduser("~/.desk-buddy")
 CONFIG_FILE = os.path.join(HOME, "config.json")
@@ -139,9 +145,62 @@ def describe(status):
     """One line for the tray tooltip / status header."""
     if not status:
         return "Bridge not running"
-    link = {"usb": "USB", "wifi": "Wi-Fi"}.get(status.get("link"), status.get("link") or "")
+    link = {"usb": "USB", "wifi": "Wi-Fi", "relay": "the remote link"}.get(status.get("link"), status.get("link") or "")
     board = f"board on {link}" if status.get("device") else "board not connected"
     return f"{status.get('mood', '?')} · {board}"
+
+
+def describe_relay(status):
+    """The remote link in a few words, or None when it isn't set up (no relay_token, so no listener)."""
+    r = (status or {}).get("relay")
+    if not r:
+        return None
+    if not r.get("paired"):
+        return "Remote Lump: waiting for the relay to connect"
+    board = {True: "plugged in there", False: "not plugged in there"}.get(r.get("board"), "not reported yet")
+    return "Remote Lump: relay connected, board %s%s" % (board, " (in use)" if r.get("active") else "")
+
+
+# ---------- the remote link's token (config.json "relay_token") ----------
+def new_relay_token(path=CONFIG_FILE, replace=False):
+    """Make a relay token (128 random bits as hex) unless there is one already (or replace is set).
+    Returns whether a new one was written. The bridge notices within a few seconds."""
+    if read_json(path).get("relay_token") and not replace:
+        return False
+    update_json(path, {"relay_token": secrets.token_hex(16)})
+    return True
+
+
+def remove_relay_token(path=CONFIG_FILE):
+    """Turn the remote link off: the bridge stops listening and drops the relay within a few seconds."""
+    had = bool(read_json(path).get("relay_token"))
+    if had:
+        update_json(path, {}, remove=("relay_token",))
+    return had
+
+
+def relay_setup_command(bridge_host):
+    """What to run on the computer Lump is plugged into. It never contains the token: the installer asks for it
+    there (hidden), so it doesn't end up in a command line, a shell history or a screenshot."""
+    return ("powershell -ExecutionPolicy Bypass -File tools\\windows\\install.ps1 -Relay -BridgeHost %s" % bridge_host)
+
+
+def cli(argv):
+    """The command-line helpers install.ps1 uses. Returns an exit code, or None when argv asks for none of them."""
+    if "--ensure-relay-token" in argv:
+        print("made a new relay token" if new_relay_token() else "relay token already set")
+        return 0
+    if "--remove-relay-token" in argv:
+        print("relay token removed" if remove_relay_token() else "no relay token was set")
+        return 0
+    if "--relay-command" in argv:
+        i = argv.index("--relay-command")
+        host = argv[i + 1] if i + 1 < len(argv) else ""
+        if not host or not all(c.isalnum() or c in ".-" for c in host):
+            print("--relay-command needs this PC's Tailscale name"); return 2
+        print(relay_setup_command(host))
+        return 0
+    return None
 
 
 def bridge_ctl(action):
@@ -285,7 +344,12 @@ class ControlWindow:
                  f"Sound {'on' if st.get('sound') else 'off'} · Claude app in front: {'yes' if (st.get('focus') or {}).get('claude_in_front') else 'no'}"]
         if meeting:
             lines.append("Next meeting: %s at %s" % (meeting.get("title") or "untitled", time.strftime("%H:%M", time.localtime(meeting["start"]))))
+        remote = describe_relay(st)
+        if remote:
+            lines.append(remote)
         self.facts.config(text="\n".join(lines))
+        if hasattr(self, "relay_state"):
+            self.show_relay_state(st)
         self.sessions.delete(*self.sessions.get_children())
         for sid, s in sorted((st.get("sessions") or {}).items(), key=lambda kv: kv[1].get("age_s", 0)):
             age = s.get("age_s", 0)
@@ -448,6 +512,39 @@ class ControlWindow:
         row = ttk.Frame(f, padding=(0, 14, 0, 0)); row.grid(row=13, column=0, columnspan=2, sticky="w")
         ttk.Button(row, text="Save", command=self.save_settings).pack(side="left")
         ttk.Label(f, text="The bridge picks up changes by itself.", style="Note.TLabel").grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        # Lump plugged into another computer, whose relay dials in here (tools/lump_relay.py)
+        ttk.Label(f, text="Remote Lump", font=("Segoe UI", 10, "bold")).grid(row=15, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.relay_state = ttk.Label(f, text="", justify="left")
+        self.relay_state.grid(row=16, column=0, columnspan=2, sticky="w")
+        row = ttk.Frame(f, padding=(0, 6, 0, 0)); row.grid(row=17, column=0, columnspan=2, sticky="w")
+        ttk.Button(row, text="Copy token", command=self.copy_relay_token).pack(side="left")
+        ttk.Button(row, text="New token", command=self.renew_relay_token).pack(side="left", padx=6)
+        self.show_relay_state(None)
+
+    def show_relay_state(self, st):
+        if not read_json(CONFIG_FILE).get("relay_token"):
+            text = "Not set up. On this PC run: tools\\windows\\install.ps1 -AllowRelay"
+        else:
+            text = "Set up (token in config.json). " + (describe_relay(st) or "Waiting for the bridge to start listening.")
+        self.relay_state.config(text=text)
+
+    def copy_relay_token(self):
+        tok = read_json(CONFIG_FILE).get("relay_token")
+        if not tok:
+            self.say("the remote link isn't set up (install.ps1 -AllowRelay)"); return
+        self.root.clipboard_clear(); self.root.clipboard_append(tok)
+        self.say("relay token copied: paste it where the relay installer asks for it")
+
+    def renew_relay_token(self):
+        from tkinter import messagebox
+        if not read_json(CONFIG_FILE).get("relay_token"):
+            self.say("the remote link isn't set up (install.ps1 -AllowRelay)"); return
+        if not messagebox.askyesno("New relay token", "Make a new relay token? The remote Lump disconnects until "
+                                   "its computer gets the new one (run install.ps1 -Relay there again)."):
+            return
+        new_relay_token(replace=True)
+        self.show_relay_state(self.status)
+        self.say("new relay token made: the relay is disconnected until it has it")
 
     def save_settings(self):
         v = {k: var.get().strip() for k, var in self.fields.items()}
@@ -841,6 +938,9 @@ def run_webview(bridge, start_hidden):
 
 
 def main():
+    code = cli(sys.argv[1:])
+    if code is not None:
+        sys.exit(code)
     if already_running():
         return
     try:
