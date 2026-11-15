@@ -246,7 +246,7 @@ class ControlWindow:
         self.tk, self.ttk, self.root, self.bridge = tk, ttk, root, bridge
         self.status = None
         root.title("Lump Control")
-        root.geometry("560x600")
+        root.geometry("580x760")
         root.minsize(480, 480)
         root.protocol("WM_DELETE_WINDOW", self.hide)
         icon = os.path.join(HOME, "lump_icon.png")
@@ -502,24 +502,25 @@ class ControlWindow:
         field(1, "lump_host", "Wi-Fi host", cfg.get("lump_host", ""), note="used when he's not on USB (default lump.local)")
         ttk.Label(f, text="Wi-Fi pairing: " + ("set up" if cfg.get("lump_token") else "not set up (run tools/wifi_setup.py with him plugged in)"),
                   style="Note.TLabel").grid(row=3, column=1, sticky="w")
-        ttk.Label(f, text="Calendar", font=("Segoe UI", 10, "bold")).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        field(5, "calendar_ics", "Private iCal link", cfg.get("calendar_ics", ""), secret=True)
-        field(6, "my_email", "Your email", cfg.get("my_email", ""), note="skips meetings you've declined")
-        ttk.Label(f, text="Slack", font=("Segoe UI", 10, "bold")).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        field(9, "slack_token", "User token (xoxp-…)", cfg.get("slack_token", ""), secret=True)
-        field(10, "slack_vips", "VIPs", ", ".join(cfg.get("slack_vips") or []), note="names as Slack shows them, comma separated")
-        field(12, "slack_vip_minutes", "Letter lasts (minutes)", str(cfg.get("slack_vip_minutes") or ""))
-        row = ttk.Frame(f, padding=(0, 14, 0, 0)); row.grid(row=13, column=0, columnspan=2, sticky="w")
-        ttk.Button(row, text="Save", command=self.save_settings).pack(side="left")
-        ttk.Label(f, text="The bridge picks up changes by itself.", style="Note.TLabel").grid(row=14, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        # Lump plugged into another computer, whose relay dials in here (tools/lump_relay.py)
-        ttk.Label(f, text="Remote Lump", font=("Segoe UI", 10, "bold")).grid(row=15, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        self.relay_state = ttk.Label(f, text="", justify="left")
-        self.relay_state.grid(row=16, column=0, columnspan=2, sticky="w")
-        row = ttk.Frame(f, padding=(0, 6, 0, 0)); row.grid(row=17, column=0, columnspan=2, sticky="w")
+        # Lump plugged into another computer, whose relay dials in here (tools/lump_relay.py). Kept up here with
+        # his other connection settings, so it's on screen without scrolling.
+        ttk.Label(f, text="Remote Lump", font=("Segoe UI", 10, "bold")).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.relay_state = ttk.Label(f, text="", justify="left", wraplength=500)
+        self.relay_state.grid(row=5, column=0, columnspan=2, sticky="w")
+        row = ttk.Frame(f, padding=(0, 6, 0, 0)); row.grid(row=6, column=0, columnspan=2, sticky="w")
         ttk.Button(row, text="Copy token", command=self.copy_relay_token).pack(side="left")
         ttk.Button(row, text="New token", command=self.renew_relay_token).pack(side="left", padx=6)
         self.show_relay_state(None)
+        ttk.Label(f, text="Calendar", font=("Segoe UI", 10, "bold")).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        field(8, "calendar_ics", "Private iCal link", cfg.get("calendar_ics", ""), secret=True)
+        field(9, "my_email", "Your email", cfg.get("my_email", ""), note="skips meetings you've declined")
+        ttk.Label(f, text="Slack", font=("Segoe UI", 10, "bold")).grid(row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        field(12, "slack_token", "User token (xoxp-…)", cfg.get("slack_token", ""), secret=True)
+        field(13, "slack_vips", "VIPs", ", ".join(cfg.get("slack_vips") or []), note="names as Slack shows them, comma separated")
+        field(15, "slack_vip_minutes", "Letter lasts (minutes)", str(cfg.get("slack_vip_minutes") or ""))
+        row = ttk.Frame(f, padding=(0, 14, 0, 0)); row.grid(row=16, column=0, columnspan=2, sticky="w")
+        ttk.Button(row, text="Save", command=self.save_settings).pack(side="left")
+        ttk.Label(f, text="The bridge picks up changes by itself.", style="Note.TLabel").grid(row=17, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     def show_relay_state(self, st):
         if not read_json(CONFIG_FILE).get("relay_token"):
