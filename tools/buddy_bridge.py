@@ -37,7 +37,7 @@ It sends a heartbeat ("h", which also carries the time of day) every 15 s; witho
 goes its own way after a minute and shows he's not connected. Session state is kept in
 ~/.desk-buddy/state.json across restarts.
 
-Extras for debugging:  GET /status   POST /cmd  (body: a raw command such as "s done")
+Extras for debugging:  GET /status   POST /cmd  (body: a raw command such as "s done")   POST /resync
                        GET /sound    POST /sound (body: on | off | toggle | play <moment>)
                        (play tap_<gag>_<mood> plays a gag's sound, e.g. play tap_shock_idle)
 Install as a login item with tools/install_bridge.sh (macOS) or tools/windows/install.ps1 (Windows).
@@ -1175,6 +1175,15 @@ class Buddy:
             self.woke_at = time.time()
             self.sound("waking_up")
         self.update()
+        self.send_tap_threshold()
+
+    def send_tap_threshold(self):
+        """The board forgets its tap sensitivity when it restarts: resend the one in config.json, if any
+        (set from Lump Control). Without one the board keeps its own default."""
+        try: t = float(read_config().get("tap_threshold") or 0)
+        except (TypeError, ValueError): return
+        if t:
+            self.dev.send(f"T {t:.2f}")
 
     def sound_tick(self, now):
         """Sounds that come from time passing rather than from a hook."""
@@ -1633,6 +1642,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 p = json.loads(body or b"{}") or {}
                 buddy.set_usage(p.get("rate_limits"), account=account_of_config(p.get("transcript_path")))
             except Exception as e: log.info("bad usage payload: %s", e)
+        elif self.path == "/resync":              # resend everything he should be showing (after a test from Lump Control)
+            buddy.update(force=True); self._reply(200, b"ok")
         elif self.path == "/calendar":            # re-read the calendar now
             buddy.calendar.refresh_now(); self._reply(200, b"refreshing")
         elif self.path == "/cmd":

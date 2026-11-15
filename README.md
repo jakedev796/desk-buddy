@@ -118,6 +118,12 @@ python tools\install_hooks.py
 ~\.desk-buddy\venv\Scripts\python tools\ota.py
 ```
 
+**Lump Control.** The installer also puts a small Lump in your system tray (it starts at logon too). Click
+him for a window that shows what he's showing and why (sessions, usage, link), plays any animation,
+previews moods, sets tap sensitivity, switches sounds and individual moments on and off, and edits the
+Wi-Fi host, calendar and Slack settings. Right-click for quick play, sound on/off and restarting the
+bridge. It only talks to the bridge's local API and its settings files, so changes apply straight away.
+
 How it differs from the Mac: his usage colour also follows the desktop app (which has no status line) by
 reading its own usage history, sounds play through Windows, and Chat and Cowork states aren't tracked
 yet (Code sessions are). `tools\windows\bridge.ps1 -Status | -Stop | -Start` checks or restarts the bridge;
@@ -193,7 +199,7 @@ calendar / Slack ──┘   one mood for all sessions                   plays b
 | `tools/appwatch/` | Swift helper that reads Chat/Cowork state from the Claude app's accessibility tree |
 | `tools/lumpbar/` | Lump on your Mac: frame baker (`bake.py`) and the notch/menu bar app (`main.swift`) |
 | `tools/flash.sh`, `tools/ota.py`, `tools/wifi_setup.py` | Getting firmware and drawings onto the board |
-| `tools/windows/` | Windows: `flash.ps1`, `install.ps1` (bridge at logon), `bridge.ps1` (start/stop/status), `keepalive.py` |
+| `tools/windows/` | Windows: `flash.ps1`, `install.ps1` (bridge at logon), `bridge.ps1` (start/stop/status), `keepalive.py`, `control.py` (Lump Control tray app) |
 | `enclosure/` | OpenSCAD source for the adjustable monitor mount, with [ready-to-print STLs](enclosure/print/) |
 | `tests/` | Bridge tests (no board needed): `~/.desk-buddy/venv/bin/python -m unittest discover -s tests` (Windows: `venv\Scripts\python`) |
 
