@@ -1025,3 +1025,12 @@ class ControlRelay(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelayAnimationLines(unittest.TestCase):
+    """The firmware's "event <name>" lines come through a relay too, but only real animation names."""
+    def test_event_lines_from_a_relay(self):
+        for ok in ("event fidget_toss", "event oops", "event hello", "event tap_disco_working", "event tap_startle_night"):
+            self.assertEqual(bridge.relay_line_kind(ok), "event", ok)
+        for bad in ("event ../../x", "event tap_disco", "event fidget_toss_extra", "event " + "a" * 300, "events hello"):
+            self.assertIsNone(bridge.relay_line_kind(bad), bad)

@@ -7,7 +7,7 @@ is plugged into by USB, dials out to that bridge over Tailscale, and passes line
                     bridge needs: one line each, starting with s e p o c h T i or ?, at most 240 characters,
                     no control characters. Anything else (above all "w", which would rewrite the board's Wi-Fi
                     details) is dropped and answered with "err relay refused".
-  board -> bridge   what the board prints (taps, gags, its boot line), plus "relay board 1" or "relay board 0"
+  board -> bridge   what the board prints (taps, gags, animations, its boot line), plus "relay board 1" or "relay board 0"
                     every 10 s and whenever he's plugged in or unplugged, so the bridge knows he's here and
                     that this computer is awake.
 

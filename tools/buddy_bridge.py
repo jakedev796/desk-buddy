@@ -92,6 +92,14 @@ BOARD_MOODS = ("idle", "awake", "working", "alert", "waiting", "done", "longhaul
 GAG_EVENT_RE = re.compile(r"tap_(%s)_(%s)" % ("|".join(GAGS + ("startle", "prep", "plane")), "|".join(BOARD_MOODS)))
 
 
+# the one-off animations the board can announce ("event <name>"): its fidgets, oops, hello and the tap gags
+EVENT_ANIM_RE = re.compile(r"fidget_(toss|twitch|bubble)|oops|hello|" + GAG_EVENT_RE.pattern)
+
+
+def event_anim_ok(name):
+    return isinstance(name, str) and EVENT_ANIM_RE.fullmatch(name) is not None
+
+
 def gag_event_ok(event):
     """Is this a gag the board can really print (tap_<gag>_<mood>, both from the known sets)?"""
     return isinstance(event, str) and GAG_EVENT_RE.fullmatch(event) is not None
@@ -564,6 +572,8 @@ def relay_line_kind(text):
         return "boot"
     if text.startswith("gag ") and gag_event_ok(text[4:]):
         return "gag"
+    if text.startswith("event ") and event_anim_ok(text[6:]):   # what he's playing, for a window mirroring him
+        return "event"
     return None
 
 
