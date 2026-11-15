@@ -735,7 +735,19 @@ class RelayListener:
             delay = min(self.FAIL_DELAY * 2 ** min(self.fails - 1, 10), self.FAIL_DELAY_MAX)
         self._fail_log("remote link: a connection didn't pair (wrong or no token), closed it")
         time.sleep(delay)          # slows guessing; holds one of the few unpaired slots meanwhile, never the accept loop
-        try: conn.sendall(b"err pairing\n")
+        try:
+            conn.sendall(b"err pairing\n")
+            # Close gracefully: with unread bytes still waiting (an oversized line), Windows would answer a plain
+            # close with a reset, which can wipe "err pairing" before the other end reads it. So say we're done
+            # sending, then drain a little (bounded) before closing.
+            conn.shutdown(socket.SHUT_WR)
+            conn.settimeout(0.1)
+            end, drained = time.time() + 0.5, 0
+            while time.time() < end and drained < 4096:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                drained += len(chunk)
         except OSError: pass
         self._close(conn)
 
