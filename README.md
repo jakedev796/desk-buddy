@@ -109,6 +109,11 @@ python3 tools/lumpbar/bake.py      # shrink his drawings (needs Google Chrome; r
 zsh tools/lumpbar/build.sh         # builds ~/Applications/Lump.app and starts it
 ```
 
+**Click him** to open whatever he's on about: the Claude Code session or Cowork task that needs you, the
+one that's working, what just finished, a VIP's Slack DM, or the meeting that's starting. With nothing going
+on, he opens where you left off. Chats only bring their Claude window forward, because the app doesn't keep
+a chat's id where Lump can read it. The bridge decides what's most relevant (`curl 127.0.0.1:47823/open`).
+
 The Mac can't tell how far away you are, so it uses your monitor as a stand-in. While your **desk
 monitor** is plugged in and the desk Lump is online, you're "at your desk" and the Mac one hides. Right-click him to:
 

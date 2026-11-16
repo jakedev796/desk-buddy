@@ -724,5 +724,112 @@ class FocusAcrossAccounts(unittest.TestCase):
             self.assertIsNone(self.f._front_account('"CFBundleIdentifier"="com.apple.Terminal"\n"pid"=9'))
 
 
+class OpenOnClick(BridgeTest):
+    """GET /open: clicking the Mac Lump opens whatever he's showing you about."""
+    def setUp(self):
+        super().setUp()
+        self.support = tempfile.mkdtemp(prefix="deskbuddy-support-")
+        p = mock.patch.object(bridge.AppSessions, "SUPPORT", self.support)
+        p.start(); self.addCleanup(p.stop)
+        self.b.app_sessions = bridge.AppSessions()
+        self.code("Claude", "local_alert", "cli-alert", "Fix the login bug")
+        self.code("Claude", "local_busy", "cli-busy", "Lump on the Mac")
+        self.code("Claude-Work", "local_work", "cli-work", "Quarterly numbers")
+
+    def record(self, folder, kind, local, **fields):
+        d = os.path.join(self.support, folder, kind, "acct", "org")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, local + ".json"), "w") as f:
+            json.dump({"sessionId": local, **fields}, f, separators=(",", ":"))
+
+    def code(self, folder, local, cli, title):
+        self.record(folder, "claude-code-sessions", local, cliSessionId=cli, title=title, isArchived=False)
+
+    def opens(self):
+        return self.b.open_target()
+
+    def test_needs_you_opens_the_session_asking(self):
+        self.hook("UserPromptSubmit", "cli-busy")
+        self.clock.advance(5)
+        self.hook("PermissionRequest", "cli-alert")
+        self.assertEqual(self.mood(), "alert")
+        o = self.opens()
+        self.assertEqual(o["url"], "claude://code/continue?session=local_alert")
+        self.assertEqual(o["account"], "personal")
+        self.assertEqual(o["what"], "Fix the login bug")
+
+    def test_working_opens_the_busiest_most_recent_session(self):
+        self.hook("UserPromptSubmit", "cli-alert"); self.hook("Stop", "cli-alert")
+        self.clock.advance(60)
+        self.hook("UserPromptSubmit", "cli-busy")
+        self.assertEqual(self.mood(), "working")
+        self.assertEqual(self.opens()["url"], "claude://code/continue?session=local_busy")
+
+    def test_a_finish_opens_what_just_finished(self):
+        self.hook("UserPromptSubmit", "cli-busy")
+        self.hook("UserPromptSubmit", "cli-alert"); self.hook("Stop", "cli-alert")
+        self.assertEqual(self.mood(), "done")
+        self.assertEqual(self.opens()["url"], "claude://code/continue?session=local_alert")
+
+    def test_unread_result_opens_it(self):
+        self.hook("UserPromptSubmit", "cli-alert"); self.hook("Stop", "cli-alert")
+        self.clock.advance(60)                                  # past the celebration
+        self.assertEqual(self.mood(), "awake")
+        self.assertEqual(self.opens()["url"], "claude://code/continue?session=local_alert")
+
+    def test_work_sessions_go_to_the_work_copy(self):
+        self.hook("PermissionRequest", "cli-work", transcript_path=WORK_TRANSCRIPT)
+        o = self.opens()
+        self.assertEqual(o["url"], "claude://code/continue?session=local_work")
+        self.assertEqual(o["account"], "work")
+
+    def test_a_cowork_task_is_found_by_its_title(self):
+        self.record("Claude-Work", "local-agent-mode-sessions", "local_task", title="For random bet forgiveness, check the rules", lastActivityAt=5)
+        self.b.external("app:work:For random bet forgiveness,…", "alert", account="work")
+        o = self.opens()
+        self.assertEqual(o["url"], "claude://claude.ai/cowork/local_task")
+        self.assertEqual(o["account"], "work")
+
+    def test_a_chat_without_an_id_just_brings_its_copy_forward(self):
+        self.b.external("app:work:Plans", "alert", account="work")
+        o = self.opens()
+        self.assertIsNone(o["url"])
+        self.assertEqual(o["account"], "work")
+
+    def test_a_terminal_session_has_no_app_link(self):
+        self.hook("PermissionRequest", "cli-from-terminal")
+        self.assertIsNone(self.opens()["url"])
+
+    def test_a_vip_letter_opens_that_slack_dm(self):
+        self.b.slack_team = "T1"
+        self.b.slack_letter("D123", "Sam", "1.0")
+        self.assertEqual(self.mood(), "letter")
+        self.assertEqual(self.opens()["url"], "slack://channel?team=T1&id=D123")
+
+    def test_meeting_time_opens_the_call(self):
+        with open(bridge.MEETINGS_FILE, "w") as f:
+            json.dump([{"start": NOON - 5, "end": NOON + 1800, "title": "Standup", "url": "https://meet.google.com/abc-defg-hij"}], f)
+        self.assertEqual(self.mood(), "meeting")
+        o = self.opens()
+        self.assertEqual(o["url"], "https://meet.google.com/abc-defg-hij")
+        self.assertEqual(o["what"], "Standup")
+
+    def test_asleep_opens_where_you_left_off(self):
+        self.hook("SessionStart", "cli-busy")
+        self.clock.advance(60)
+        self.hook("SessionStart", "cli-alert")
+        self.clock.advance(3600)
+        self.assertEqual(self.mood(), "idle")
+        self.assertEqual(self.opens()["url"], "claude://code/continue?session=local_alert")
+
+
+class MeetingLinks(unittest.TestCase):
+    def test_the_join_link_is_found_in_the_invite(self):
+        self.assertEqual(bridge.meeting_link({"X-GOOGLE-CONFERENCE": "https://meet.google.com/abc-defg-hij"}), "https://meet.google.com/abc-defg-hij")
+        self.assertEqual(bridge.meeting_link({"LOCATION": "Room 4", "DESCRIPTION": "Join: https://acme.zoom.us/j/123?pwd=x.\nThanks"}), "https://acme.zoom.us/j/123?pwd=x")
+        self.assertEqual(bridge.meeting_link({"LOCATION": "https://example.com/room"}), "https://example.com/room")
+        self.assertIsNone(bridge.meeting_link({"LOCATION": "Room 4", "DESCRIPTION": "see https://docs.example.com/agenda"}))
+
+
 if __name__ == "__main__":
     unittest.main()

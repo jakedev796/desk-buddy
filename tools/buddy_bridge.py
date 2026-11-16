@@ -306,7 +306,7 @@ class Calendar:
             en = e.get("DTEND").dt if e.get("DTEND") else st + datetime.timedelta(minutes=30)
             if st.tzinfo is None: st = st.astimezone()
             if en.tzinfo is None: en = en.astimezone()
-            out.append({"start": st.timestamp(), "end": en.timestamp(), "title": str(e.get("SUMMARY", ""))[:80]})
+            out.append({"start": st.timestamp(), "end": en.timestamp(), "title": str(e.get("SUMMARY", ""))[:80], "url": meeting_link(e)})
         out.sort(key=lambda m: m["start"])
         tmp = MEETINGS_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -444,6 +444,84 @@ class Focus:
             except Exception as e:
                 log.info("focus check failed: %s", e)
             time.sleep(1.5)
+
+
+class AppSessions:
+    """The Claude app's own ids for sessions, so clicking the Mac Lump can open one (GET /open).
+
+    Each copy of the app keeps a small JSON file per session: <data folder>/claude-code-sessions/…/local_….json
+    for Code (with the cliSessionId the hooks report) and local-agent-mode-sessions/…/local_….json for Cowork
+    (with its title, which is all the app watcher sees). Only the start of each file is read, and a file is
+    only read again when it changes."""
+
+    SUPPORT = APP_SUPPORT
+    CODE, COWORK = "claude-code-sessions", "local-agent-mode-sessions"
+    HEAD = 32768
+    FIELD = {k: re.compile(r'"%s"\s*:\s*("(?:[^"\\]|\\.)*"|\d+|true|false)' % k)
+             for k in ("sessionId", "cliSessionId", "title", "lastActivityAt", "isArchived")}
+
+    def __init__(self):
+        self._seen = {}                                  # path -> (mtime, fields)
+
+    def _fields(self, path):
+        with open(path, "rb") as f:
+            head = f.read(self.HEAD).decode(errors="replace")
+        out = {}
+        for k, rx in self.FIELD.items():
+            m = rx.search(head)
+            if m:
+                try: out[k] = json.loads(m.group(1))
+                except ValueError: pass
+        return out
+
+    def _scan(self, kind):
+        """[(account, fields)] for every session file of that kind, in every copy of the app."""
+        out = []
+        for path in glob.glob(os.path.join(glob.escape(self.SUPPORT), "Claude*", kind, "*", "*", "local_*.json")):
+            try:
+                mtime = os.path.getmtime(path)
+                hit = self._seen.get(path)
+                if not hit or hit[0] != mtime:
+                    hit = self._seen[path] = (mtime, self._fields(path))
+            except OSError:
+                continue
+            out.append((account_of_data_dir(path[:path.index(os.sep + kind + os.sep)]), hit[1]))
+        return out
+
+    def code(self, cli):
+        """(account, local id, title) of the desktop Code session behind a hook session_id, or None
+        (say, a session started in a terminal)."""
+        for acct, f in self._scan(self.CODE):
+            if f.get("cliSessionId") == cli and f.get("sessionId") and not f.get("isArchived"):
+                return acct, f["sessionId"], f.get("title")
+        return None
+
+    def cowork(self, account, title):
+        """Local id of the newest Cowork task in that account whose title matches what the app watcher
+        read off the screen (which may be cut short with "…")."""
+        want = (title or "").rstrip("…").strip()
+        if not want:
+            return None
+        hits = [f for acct, f in self._scan(self.COWORK)
+                if acct == account and f.get("sessionId") and not f.get("isArchived") and (f.get("title") or "").startswith(want)]
+        return max(hits, key=lambda f: f.get("lastActivityAt") or 0)["sessionId"] if hits else None
+
+
+MEETING_HOSTS = re.compile(r"https://[\w.-]*(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|teams\.live\.com|webex\.com|whereby\.com|around\.co)/[^\s<>\"']*")
+
+
+def meeting_link(event):
+    """The join link in a calendar invite (an icalendar event, or any dict-like with its fields):
+    Google's conference field, then a known meeting host anywhere, then a bare link as the location."""
+    conf = str(event.get("X-GOOGLE-CONFERENCE") or "").strip()
+    if conf.startswith("https://"):
+        return conf
+    for field in ("URL", "LOCATION", "DESCRIPTION"):
+        m = MEETING_HOSTS.search(str(event.get(field) or ""))
+        if m:
+            return m.group(0).rstrip(".,;)")
+    loc = str(event.get("LOCATION") or "").strip()
+    return loc if re.fullmatch(r"https://\S+", loc) else None
 
 
 class Sounds:
@@ -640,6 +718,8 @@ class Buddy:
         self.last_beat = 0.0
         self.saved = None                         # last state.json we wrote
         self.letters = {}                         # Slack: VIP DMs you haven't read, channel -> {"from", "ts", "since"}
+        self.slack_team = None                    # your Slack workspace id, for slack:// links
+        self.app_sessions = AppSessions()         # the Claude app's own session ids, for GET /open
         self.last_plane = 0.0
         self.load_state()
         self.dev = dev or Device(self.resend, self.board_line)
@@ -967,6 +1047,68 @@ class Buddy:
     def mood(self):
         with self.lock:
             return self.mood_locked(time.time())
+
+    # ---- clicking the Mac Lump (GET /open) ----
+    def _relevant_locked(self, now, mood):
+        """What his current mood is about: ("meeting", m), ("letter", channel), ("session", sid, s) or None."""
+        if mood == "meeting":
+            return ("meeting", self.next_meeting(now))
+        if mood == "letter":
+            letters = self.letters_locked(now)
+            if letters:
+                return ("letter", max(letters, key=lambda ch: letters[ch]["since"]))
+        def newest(pred, key=lambda s: s["t"]):
+            hits = [(sid, s) for sid, s in self.sessions.items() if pred(s)]
+            return max(hits, key=lambda kv: key(kv[1])) if hits else None
+        eff = lambda s: self._effective(s, now)
+        pick = None
+        if mood in ("alert", "waiting"):
+            pick = newest(lambda s: eff(s) in ("alert", "snoozed"))
+        elif mood in ("working", "longhaul"):
+            pick = newest(lambda s: eff(s) == "working")
+        elif mood == "done":
+            pick = newest(lambda s: s["state"] == "done")
+        elif mood == "awake":
+            pick = newest(lambda s: s.get("unseen") and now - s["unseen"] < UNSEEN_SECS, key=lambda s: s["unseen"])
+        pick = pick or newest(lambda s: True)           # asleep, or nothing matched: where you left off
+        return ("session",) + pick if pick else None
+
+    def open_target(self):
+        """The most relevant thing to open right now, for a click on the Mac Lump:
+        {"url": link or None (just bring that Claude copy forward), "account": which copy, "what": a label}.
+        Needs you -> the session asking; working -> the busiest; done/unread -> what finished;
+        VIP letter -> that Slack DM; meeting -> the call; asleep -> where you left off."""
+        with self.lock:
+            now = time.time()
+            mood = self.mood_locked(now)
+            rel = self._relevant_locked(now, mood)
+            fallback = getattr(self.focus, "last_account", None) or PERSONAL
+            out = {"mood": mood, "url": None, "account": fallback, "what": "Claude"}
+            if rel and rel[0] == "session":
+                sid, s = rel[1], dict(rel[2])
+            team = self.slack_team
+        if not rel:
+            return out
+        if rel[0] == "meeting":
+            m = rel[1] or {}
+            return {**out, "url": m.get("url"), "account": None, "what": m.get("title") or "Meeting"}
+        if rel[0] == "letter":
+            url = "slack://channel?team=%s&id=%s" % (team, rel[1]) if team else "slack://open"
+            return {**out, "url": url, "account": None, "what": "Slack"}
+        acct = s.get("account", PERSONAL)
+        if sid.startswith("app:"):                       # Chat / Cowork: "app:[<account>:]<title>"
+            title = sid[4:]
+            if acct != PERSONAL and title.startswith(acct + ":"):
+                title = title[len(acct) + 1:]
+            local = self.app_sessions.cowork(acct, title)
+            return {**out, "account": acct, "what": title,
+                    "url": "claude://claude.ai/cowork/%s" % local if local else None}
+        hit = self.app_sessions.code(sid)
+        if not hit:                                      # not a desktop Code session (a terminal, say)
+            return {**out, "account": acct, "what": os.path.basename(s.get("cwd") or "") or "Claude Code"}
+        acct, local, title = hit
+        return {**out, "account": acct, "url": "claude://code/continue?session=%s" % local,
+                "what": title or os.path.basename(s.get("cwd") or "") or "Claude Code"}
 
     # ---- talking to the board ----
     def update(self, force=False):
@@ -1337,7 +1479,8 @@ class SlackWatch:
         if token != self.token:
             self.token, self.me, self.users_at, self.ims_at, self.backoff = token, None, 0.0, 0.0, 0.0
         if not self.me:
-            self.me = self.call("auth.test")["user_id"]
+            who = self.call("auth.test")
+            self.me, self.buddy.slack_team = who["user_id"], who.get("team_id")   # team: for slack:// links (GET /open)
             log.info("slack: connected")
         vip_names = {str(n).strip().lower() for n in cfg.get("slack_vips") or [] if str(n).strip()}
         if now - self.users_at > self.USERS_EVERY:
@@ -1488,6 +1631,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reply(200, json.dumps(buddy.sounds.settings(), indent=2).encode(), "application/json")
         elif self.path == "/play":
             self._reply(200, json.dumps(list(ANIMATIONS)).encode(), "application/json")
+        elif self.path == "/open":                # what clicking the Mac Lump should open
+            self._reply(200, json.dumps(buddy.open_target()).encode(), "application/json")
         else:
             self._reply(404)
 

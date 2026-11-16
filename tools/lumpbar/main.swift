@@ -8,6 +8,8 @@
 // On a MacBook with a notch he sits in a little black wing just right of the camera.
 // With no notch screen he's a menu bar item instead.
 // No pop-outs, no text: notifications already do that. Right-click him for options.
+// Click him to open what he's on about (the bridge picks it: GET /open): the thread that needs you,
+// the one that's working, what just finished, a VIP's Slack DM, or the meeting that's starting.
 //
 // Mood and colour come from the bridge (GET 127.0.0.1:47823/status, once a second).
 // Frames come from tools/lumpbar/bake.py (copied into the app's Resources/frames).
@@ -16,6 +18,8 @@
 import Cocoa
 
 let STATUS_URL = URL(string: "http://127.0.0.1:47823/status")!
+let OPEN_URL = URL(string: "http://127.0.0.1:47823/open")!
+let CLAUDE_ID = "com.anthropic.claudefordesktop"
 let DEFAULT_COLOUR = "FF7A45"
 let PEEK: TimeInterval = 60             // opening the app shows him (menu open) at most this long, even at the desk
 let LINGER: TimeInterval = 2            // after that menu closes, he stays this long before hiding again
@@ -100,7 +104,7 @@ final class WingView: NSView {
     var image: CGImage? { didSet { needsDisplay = true } }
     var overlap: CGFloat = 12        // how far the wing reaches under the notch, to fill its rounded corner
     var dim: CGFloat = 1 { didSet { needsDisplay = true } }
-    var onRightClick: ((NSEvent) -> Void)?
+    var onRightClick: ((NSEvent) -> Void)?, onClick: (() -> Void)?
 
     override func draw(_ dirtyRect: NSRect) {
         let b = bounds, r = min(10, b.height * 0.3)
@@ -117,7 +121,9 @@ final class WingView: NSView {
         ctx.draw(img, in: CGRect(x: x, y: 1, width: side, height: side))
     }
     override func rightMouseDown(with event: NSEvent) { onRightClick?(event) }
-    override func mouseDown(with event: NSEvent) { if event.modifierFlags.contains(.control) { onRightClick?(event) } }
+    override func mouseDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.control) { onRightClick?(event) } else { onClick?() }
+    }
 }
 
 // MARK: - app
@@ -145,6 +151,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSLog("lumpbar: no frames in the app bundle (run tools/lumpbar/bake.py, then build.sh)"); NSApp.terminate(nil); return
         }
         sprites = s                 // placed after the first poll, so he doesn't flash up at the desk
+        if let o = ProcessInfo.processInfo.environment["LUMPBAR_OPEN"] {   // for testing a click: "<url>|<account>"
+            let parts = o.components(separatedBy: "|")
+            open(url: URL(string: parts[0]), account: parts.count > 1 ? parts[1] : nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { exit(0) }
+            return
+        }
         if ProcessInfo.processInfo.environment["LUMPBAR_PRINT_MENU"] != nil {   // for checking the menu without clicking
             menuNeedsUpdate(theMenu)
             func dump(_ m: NSMenu, _ pad: String) {
@@ -175,7 +187,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func showMenu() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             NSApp.activate(ignoringOtherApps: true)
-            if let b = self.item?.button { b.performClick(nil) }
+            if self.item != nil { self.itemMenu() }
             else if let v = self.wingView, self.wing?.isVisible == true {
                 self.theMenu.popUp(positioning: nil, at: NSPoint(x: v.bounds.maxX - v.bounds.height / 2, y: -4), in: v)
             }
@@ -239,6 +251,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let v = WingView(frame: NSRect(origin: .zero, size: frame.size))
             v.autoresizingMask = [.width, .height]
             v.onRightClick = { [weak self] e in self?.popMenu(e, in: v) }
+            v.onClick = { [weak self] in self?.openRelevant() }
+            v.toolTip = "Click to open what Lump's showing you. Right-click for options."
             p.contentView = v
             wing = p; wingView = v
         }
@@ -252,12 +266,85 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if item == nil {
             let it = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
             it.button?.imageScaling = .scaleProportionallyUpOrDown
-            it.menu = theMenu
+            it.button?.target = self
+            it.button?.action = #selector(itemClicked)
+            it.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            it.button?.toolTip = "Click to open what Lump's showing you. Right-click for options."
             item = it
         }
         item?.isVisible = true
     }
     func hideItem() { if let it = item { NSStatusBar.system.removeStatusItem(it); item = nil } }
+    @objc func itemClicked() {
+        let e = NSApp.currentEvent
+        if e?.type == .rightMouseUp || e?.modifierFlags.contains(.control) == true { itemMenu() } else { openRelevant() }
+    }
+    /// A status item shows its menu on any click once one is set, so set it only while showing it.
+    func itemMenu() { guard let it = item else { return }; it.menu = theMenu; it.button?.performClick(nil); it.menu = nil }
+
+    // MARK: click to open
+
+    /// Ask the bridge what's most relevant and open it in the right place.
+    func openRelevant() {
+        var req = URLRequest(url: OPEN_URL); req.timeoutInterval = 2
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            let j = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            DispatchQueue.main.async { self.open(url: (j?["url"] as? String).flatMap(URL.init(string:)), account: j?["account"] as? String) }
+        }.resume()
+    }
+
+    func open(url: URL?, account: String?) {
+        if let url = url, url.scheme != "claude" { NSWorkspace.shared.open(url); return }     // Slack, a meeting link
+        // a claude:// link has to reach the right copy of the app (personal and work share one bundle id)
+        let copy = claudeCopy(account ?? "personal") ?? claudeCopy("personal")
+        if let url = url {
+            if let c = copy, sendURL(url, to: c.processIdentifier) { bringForward(c) } else { NSWorkspace.shared.open(url) }
+        } else if let c = copy {
+            bringForward(c)
+        } else if let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: CLAUDE_ID) {
+            NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration())
+        }
+    }
+
+    func bringForward(_ app: NSRunningApplication) {
+        NSApp.activate(ignoringOtherApps: true)          // a click on him doesn't make us active, and macOS only lets the active app hand focus on
+        app.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    /// The running copy of the Claude app for an account: Claude Switcher starts extra accounts with
+    /// --user-data-dir=~/Library/Application Support/Claude-<Name>; personal has none.
+    func claudeCopy(_ account: String) -> NSRunningApplication? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: CLAUDE_ID).first { accountOf($0.processIdentifier) == account }
+    }
+    private var accounts: [pid_t: String] = [:]
+    func accountOf(_ pid: pid_t) -> String {
+        if let a = accounts[pid] { return a }
+        let ps = Process(), pipe = Pipe()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps"); ps.arguments = ["-o", "command=", "-p", String(pid)]
+        ps.standardOutput = pipe
+        guard (try? ps.run()) != nil else { return "personal" }
+        ps.waitUntilExit()
+        let cmd = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        var a = "personal"
+        if let r = cmd.range(of: #"--user-data-dir=(.+?)(?= --|$)"#, options: .regularExpression) {
+            let dir = (String(cmd[r].dropFirst("--user-data-dir=".count)).trimmingCharacters(in: .whitespacesAndNewlines) as NSString).lastPathComponent
+            if dir.hasPrefix("Claude-") { a = String(dir.dropFirst("Claude-".count)).lowercased() }
+        }
+        accounts[pid] = a
+        return a
+    }
+
+    /// Hand a link to one particular process, the way `open` would but without letting macOS pick the copy:
+    /// an Apple "get URL" event. macOS asks once whether Lump may control Claude.
+    func sendURL(_ url: URL, to pid: pid_t) -> Bool {
+        let GURL: UInt32 = 0x4755_524C                   // 'GURL': both the event class and id
+        let ev = NSAppleEventDescriptor(eventClass: GURL, eventID: GURL,
+                                        targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
+                                        returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+        ev.setParam(NSAppleEventDescriptor(string: url.absoluteString), forKeyword: 0x2D2D_2D2D)   // '----': the direct object
+        do { _ = try ev.sendEvent(options: [.noReply], timeout: 5); return true }
+        catch { NSLog("lumpbar: couldn't hand %@ to Claude (pid %d): %@", url.absoluteString, pid, "\(error)"); return false }
+    }
 
     // MARK: menu (rebuilt each time it opens, so the monitor list is current)
 
