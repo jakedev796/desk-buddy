@@ -25,6 +25,15 @@ let PEEK: TimeInterval = 60             // opening the app shows him (menu open)
 let LINGER: TimeInterval = 2            // after that menu closes, he stays this long before hiding again
 let DEVICE_GRACE: TimeInterval = 60     // the desk Lump has to be gone this long before he counts as away (OTA, Wi-Fi blips)
 
+// Sharing the notch with the Matchday island (the Matchday project's island/ app), over distributed notifications:
+// he posts LUMP_WING ["width": n] when his wing shows (0 when it hides); while its island is up, Matchday widens
+// the pill's right side by that much and posts ISLAND_SLOT with the slot's global rect ["x","y","w","h"]
+// ([:] when the island goes down). He moves into the slot, above the island, and draws no wing of his own there.
+let LUMP_WING = Notification.Name("com.deskbuddy.lump.wing")
+let ISLAND_SLOT = Notification.Name("local.matchday.island.slot")
+let ISLAND_HELLO = Notification.Name("local.matchday.island.hello")
+let MATCHDAY_ID = "local.matchday.island"
+
 // MARK: - frames
 
 /// The baked strips for one mood and ink, as premultiplied RGBA, painted any body colour on demand.
@@ -104,16 +113,20 @@ final class WingView: NSView {
     var image: CGImage? { didSet { needsDisplay = true } }
     var overlap: CGFloat = 12        // how far the wing reaches under the notch, to fill its rounded corner
     var dim: CGFloat = 1 { didSet { needsDisplay = true } }
+    /// Sitting in the Matchday island's slot: the island is the black behind him, so draw only Lump.
+    var docked = false { didSet { needsDisplay = true } }
     var onRightClick: ((NSEvent) -> Void)?, onClick: (() -> Void)?
 
     override func draw(_ dirtyRect: NSRect) {
         let b = bounds, r = min(10, b.height * 0.3)
-        let p = NSBezierPath()
-        p.move(to: NSPoint(x: 0, y: b.maxY)); p.line(to: NSPoint(x: b.maxX, y: b.maxY))
-        p.line(to: NSPoint(x: b.maxX, y: r))
-        p.appendArc(withCenter: NSPoint(x: b.maxX - r, y: r), radius: r, startAngle: 0, endAngle: 270, clockwise: true)
-        p.line(to: NSPoint(x: 0, y: 0)); p.close()
-        NSColor.black.setFill(); p.fill()
+        if !docked {
+            let p = NSBezierPath()
+            p.move(to: NSPoint(x: 0, y: b.maxY)); p.line(to: NSPoint(x: b.maxX, y: b.maxY))
+            p.line(to: NSPoint(x: b.maxX, y: r))
+            p.appendArc(withCenter: NSPoint(x: b.maxX - r, y: r), radius: r, startAngle: 0, endAngle: 270, clockwise: true)
+            p.line(to: NSPoint(x: 0, y: 0)); p.close()
+            NSColor.black.setFill(); p.fill()
+        }
         guard let img = image, let ctx = NSGraphicsContext.current?.cgContext else { return }
         let side = b.height - 2, x = overlap + (b.width - overlap - side) / 2
         ctx.interpolationQuality = .high
@@ -135,6 +148,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var tick = 0, shownKey = "", peekUntil = Date.distantPast, menuWhenPlaced = false
     var wing: NSPanel?, wingView: WingView?
     var item: NSStatusItem?
+    /// The slot the Matchday island keeps for him while it's up (global coordinates); nil = use his own wing.
+    var dockRect: NSRect?
+    /// The wing width last told to Matchday, so it's only re-posted when it changes.
+    var announced: CGFloat?
     let prefs = UserDefaults.standard
     var preferMenuBar: Bool { get { prefs.bool(forKey: "menuBarOnly") } set { prefs.set(newValue, forKey: "menuBarOnly") } }
     var showAlways: Bool { get { prefs.bool(forKey: "showAlways") } set { prefs.set(newValue, forKey: "showAlways") } }
@@ -168,6 +185,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             dump(theMenu, ""); exit(0)
         }
         NotificationCenter.default.addObserver(self, selector: #selector(place), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(forName: ISLAND_SLOT, object: nil, queue: .main) { [weak self] n in self?.slotChanged(n.userInfo) }
+        dnc.addObserver(forName: ISLAND_HELLO, object: nil, queue: .main) { [weak self] _ in self?.announce(force: true) }
         let anim = Timer(timeInterval: 1.0 / Double(s.manifest.fps), repeats: true) { [weak self] _ in self?.step() }
         RunLoop.main.add(anim, forMode: .common)
         let poll = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.poll() }
@@ -232,16 +252,34 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func place() {
+        defer { announce() }
         atDesk = computeAtDesk()
         if atDesk { hideWing(); hideItem(); shownKey = ""; return }   // the real one is right there
         if !preferMenuBar, let n = notch() { showWing(n); hideItem() } else { hideWing(); showItem() }
         shownKey = ""
     }
 
+    /// Tell the Matchday island how much room he needs beside it (0 = not in the notch).
+    func announce(force: Bool = false) {
+        let width: CGFloat = wing?.isVisible == true ? (notch().map { $0.height + 6 } ?? 0) : 0
+        if !force && width == announced { return }
+        announced = width
+        DistributedNotificationCenter.default().postNotificationName(LUMP_WING, object: nil, userInfo: ["width": Double(width)], deliverImmediately: true)
+    }
+
+    func slotChanged(_ info: [AnyHashable: Any]?) {
+        let v = ["x", "y", "w", "h"].compactMap { (info?[$0] as? NSNumber)?.doubleValue }
+        let rect = v.count == 4 ? NSRect(x: v[0], y: v[1], width: v[2], height: v[3]) : nil
+        guard rect != dockRect else { return }
+        dockRect = rect
+        if placed { place() }
+    }
+
     func showWing(_ n: (screen: NSScreen, height: CGFloat, right: CGFloat)) {
         let f = n.screen.frame, h = n.height
-        let overlap: CGFloat = 12, w = h + 6
-        let frame = NSRect(x: n.right - overlap, y: f.maxY - h, width: w + overlap, height: h)
+        let docked = dockRect != nil
+        let overlap: CGFloat = docked ? 0 : 12, w = h + 6
+        let frame = dockRect ?? NSRect(x: n.right - overlap, y: f.maxY - h, width: w + overlap, height: h)
         if wing == nil {
             let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = false
@@ -257,6 +295,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             wing = p; wingView = v
         }
         wingView!.overlap = overlap
+        wingView!.docked = docked
+        // In the island's slot he sits just above the island's window (main menu + 2), so it can't cover him.
+        wing!.level = docked ? NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3) : .statusBar
         wing!.setFrame(frame, display: true)
         wing!.orderFrontRegardless()
     }
@@ -395,6 +436,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let j = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             DispatchQueue.main.async {
                 defer {
+                    // Matchday quit (or crashed) without saying so: take his own wing back.
+                    if self.dockRect != nil, NSRunningApplication.runningApplications(withBundleIdentifier: MATCHDAY_ID).isEmpty {
+                        self.dockRect = nil; self.place()
+                    }
                     if !self.placed || self.computeAtDesk() != self.atDesk { self.placed = true; self.place() }
                     if self.menuWhenPlaced { self.menuWhenPlaced = false; self.showMenu() }
                 }
