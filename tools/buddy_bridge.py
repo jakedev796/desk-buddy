@@ -78,7 +78,7 @@ TAP_SNOOZE = 120                        # tapping "needs you" holds off the nagg
 # (at night the startle, before a meeting the prep), but without a tap's meaning: nothing is snoozed
 # or silenced. A named gag plays in whatever mood he's in.
 GAGS = ("shock", "moto", "wolf", "accordion", "anvil", "disco", "glass", "banana", "balloon", "sneeze", "moon", "bomb")
-ANIMATIONS = {"tap": "tap", **{g: f"tap_{g}" for g in GAGS}, "startle": "tap_startle_night", "prep": "tap_prep",
+ANIMATIONS = {"tap": "tap", **{g: f"tap_{g}" for g in GAGS}, "startle": "tap_startle_night", "prep": "tap_prep", "plane": "tap_plane",
               **{e: e for e in ("fidget_toss", "fidget_twitch", "fidget_bubble", "oops", "hello")}}
 # Usage gauge: his colour warms from Tangerine to red as the busier of your 5-hour / weekly
 # Claude limits fills up (fed by the Claude Code status line, see tools/statusline.sh).
@@ -323,7 +323,7 @@ class Calendar:
             en = e.get("DTEND").dt if e.get("DTEND") else st + datetime.timedelta(minutes=30)
             if st.tzinfo is None: st = st.astimezone()
             if en.tzinfo is None: en = en.astimezone()
-            out.append({"start": st.timestamp(), "end": en.timestamp(), "title": str(e.get("SUMMARY", ""))[:80]})
+            out.append({"start": st.timestamp(), "end": en.timestamp(), "title": str(e.get("SUMMARY", ""))[:80], "url": meeting_link(e)})
         out.sort(key=lambda m: m["start"])
         tmp = MEETINGS_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -689,6 +689,84 @@ def start_sound(path, volume):
     return subprocess.Popen(["afplay", "-v", str(volume), path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+class AppSessions:
+    """The Claude app's own ids for sessions, so clicking the Mac Lump can open one (GET /open).
+
+    Each copy of the app keeps a small JSON file per session: <data folder>/claude-code-sessions/…/local_….json
+    for Code (with the cliSessionId the hooks report) and local-agent-mode-sessions/…/local_….json for Cowork
+    (with its title, which is all the app watcher sees). Only the start of each file is read, and a file is
+    only read again when it changes."""
+
+    SUPPORT = APP_SUPPORT
+    CODE, COWORK = "claude-code-sessions", "local-agent-mode-sessions"
+    HEAD = 32768
+    FIELD = {k: re.compile(r'"%s"\s*:\s*("(?:[^"\\]|\\.)*"|\d+|true|false)' % k)
+             for k in ("sessionId", "cliSessionId", "title", "lastActivityAt", "isArchived")}
+
+    def __init__(self):
+        self._seen = {}                                  # path -> (mtime, fields)
+
+    def _fields(self, path):
+        with open(path, "rb") as f:
+            head = f.read(self.HEAD).decode(errors="replace")
+        out = {}
+        for k, rx in self.FIELD.items():
+            m = rx.search(head)
+            if m:
+                try: out[k] = json.loads(m.group(1))
+                except ValueError: pass
+        return out
+
+    def _scan(self, kind):
+        """[(account, fields)] for every session file of that kind, in every copy of the app."""
+        out = []
+        for path in glob.glob(os.path.join(glob.escape(self.SUPPORT), "Claude*", kind, "*", "*", "local_*.json")):
+            try:
+                mtime = os.path.getmtime(path)
+                hit = self._seen.get(path)
+                if not hit or hit[0] != mtime:
+                    hit = self._seen[path] = (mtime, self._fields(path))
+            except OSError:
+                continue
+            out.append((account_of_data_dir(path[:path.index(os.sep + kind + os.sep)]), hit[1]))
+        return out
+
+    def code(self, cli):
+        """(account, local id, title) of the desktop Code session behind a hook session_id, or None
+        (say, a session started in a terminal)."""
+        for acct, f in self._scan(self.CODE):
+            if f.get("cliSessionId") == cli and f.get("sessionId") and not f.get("isArchived"):
+                return acct, f["sessionId"], f.get("title")
+        return None
+
+    def cowork(self, account, title):
+        """Local id of the newest Cowork task in that account whose title matches what the app watcher
+        read off the screen (which may be cut short with "…")."""
+        want = (title or "").rstrip("…").strip()
+        if not want:
+            return None
+        hits = [f for acct, f in self._scan(self.COWORK)
+                if acct == account and f.get("sessionId") and not f.get("isArchived") and (f.get("title") or "").startswith(want)]
+        return max(hits, key=lambda f: f.get("lastActivityAt") or 0)["sessionId"] if hits else None
+
+
+MEETING_HOSTS = re.compile(r"https://[\w.-]*(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|teams\.live\.com|webex\.com|whereby\.com|around\.co)/[^\s<>\"']*")
+
+
+def meeting_link(event):
+    """The join link in a calendar invite (an icalendar event, or any dict-like with its fields):
+    Google's conference field, then a known meeting host anywhere, then a bare link as the location."""
+    conf = str(event.get("X-GOOGLE-CONFERENCE") or "").strip()
+    if conf.startswith("https://"):
+        return conf
+    for field in ("URL", "LOCATION", "DESCRIPTION"):
+        m = MEETING_HOSTS.search(str(event.get(field) or ""))
+        if m:
+            return m.group(0).rstrip(".,;)")
+    loc = str(event.get("LOCATION") or "").strip()
+    return loc if re.fullmatch(r"https://\S+", loc) else None
+
+
 class Sounds:
     """Plays Lump's voice through afplay (winsound on Windows). Settings are re-read whenever sounds.json changes, so
     flipping "enabled" (Claude Switcher, POST /sound, or by hand) takes effect immediately.
@@ -942,7 +1020,10 @@ class Buddy:
         self.last_beat = 0.0
         self.saved = None                         # last state.json we wrote
         self.letters = {}                         # Slack: VIP DMs you haven't read, channel -> {"from", "ts", "since"}
+        self.slack_team = None                    # your Slack workspace id, for slack:// links
+        self.app_sessions = AppSessions()         # the Claude app's own session ids, for GET /open
         self.last_plane = 0.0
+        self.last_anim = {"name": None, "n": 0, "t": 0.0}   # the last one-off animation asked for (see event())
         self.load_state()
         self.dev = dev or Device(self.resend, self.board_line)
         if start:
@@ -1083,14 +1164,16 @@ class Buddy:
                 l["expired"] = True
         return {ch: l for ch, l in self.letters.items() if not l.get("expired")}
 
-    def slack_letter(self, ch, sender, ts):
-        """An unread DM from a VIP (ts: Slack's id for the newest one). He holds up a letter."""
+    def slack_letter(self, ch, sender, ts, kind="dm", channel=None):
+        """A VIP wrote to you (ts: Slack's id for the newest message). He holds up a letter.
+        kind "dm": an unread 1:1 DM, keyed by its channel. kind "mention": a message that tags you in a
+        channel or group DM, keyed "m:<channel>" (one letter per conversation, the newest message wins)."""
         with self.lock:
             if (self.letters.get(ch) or {}).get("ts") == ts:
                 return False
             new = ch not in self.letters_locked(time.time())
-            self.letters[ch] = {"from": sender, "ts": ts, "since": time.time()}
-        log.info("slack: letter from %s", sender)
+            self.letters[ch] = {"from": sender, "ts": ts, "since": time.time(), "kind": kind, "ch": channel or ch}
+        log.info("slack: letter from %s (%s)", sender, kind)
         if new:
             self.sound("slack_vip")
         self.update()
@@ -1280,6 +1363,69 @@ class Buddy:
         with self.lock:
             return self.mood_locked(time.time())
 
+    # ---- clicking the Mac Lump (GET /open) ----
+    def _relevant_locked(self, now, mood):
+        """What his current mood is about: ("meeting", m), ("letter", channel), ("session", sid, s) or None."""
+        if mood == "meeting":
+            return ("meeting", self.next_meeting(now))
+        if mood == "letter":
+            letters = self.letters_locked(now)
+            if letters:
+                newest = max(letters.values(), key=lambda l: l["since"])
+                return ("letter", newest.get("ch"))
+        def newest(pred, key=lambda s: s["t"]):
+            hits = [(sid, s) for sid, s in self.sessions.items() if pred(s)]
+            return max(hits, key=lambda kv: key(kv[1])) if hits else None
+        eff = lambda s: self._effective(s, now)
+        pick = None
+        if mood in ("alert", "waiting"):
+            pick = newest(lambda s: eff(s) in ("alert", "snoozed"))
+        elif mood in ("working", "longhaul"):
+            pick = newest(lambda s: eff(s) == "working")
+        elif mood == "done":
+            pick = newest(lambda s: s["state"] == "done")
+        elif mood == "awake":
+            pick = newest(lambda s: s.get("unseen") and now - s["unseen"] < UNSEEN_SECS, key=lambda s: s["unseen"])
+        pick = pick or newest(lambda s: True)           # asleep, or nothing matched: where you left off
+        return ("session",) + pick if pick else None
+
+    def open_target(self):
+        """The most relevant thing to open right now, for a click on the Mac Lump:
+        {"url": link or None (just bring that Claude copy forward), "account": which copy, "what": a label}.
+        Needs you -> the session asking; working -> the busiest; done/unread -> what finished;
+        VIP letter -> that Slack DM; meeting -> the call; asleep -> where you left off."""
+        with self.lock:
+            now = time.time()
+            mood = self.mood_locked(now)
+            rel = self._relevant_locked(now, mood)
+            fallback = getattr(self.focus, "last_account", None) or PERSONAL
+            out = {"mood": mood, "url": None, "account": fallback, "what": "Claude"}
+            if rel and rel[0] == "session":
+                sid, s = rel[1], dict(rel[2])
+            team = self.slack_team
+        if not rel:
+            return out
+        if rel[0] == "meeting":
+            m = rel[1] or {}
+            return {**out, "url": m.get("url"), "account": None, "what": m.get("title") or "Meeting"}
+        if rel[0] == "letter":
+            url = "slack://channel?team=%s&id=%s" % (team, rel[1]) if team else "slack://open"
+            return {**out, "url": url, "account": None, "what": "Slack"}
+        acct = s.get("account", PERSONAL)
+        if sid.startswith("app:"):                       # Chat / Cowork: "app:[<account>:]<title>"
+            title = sid[4:]
+            if acct != PERSONAL and title.startswith(acct + ":"):
+                title = title[len(acct) + 1:]
+            local = self.app_sessions.cowork(acct, title)
+            return {**out, "account": acct, "what": title,
+                    "url": "claude://claude.ai/cowork/%s" % local if local else None}
+        hit = self.app_sessions.code(sid)
+        if not hit:                                      # not a desktop Code session (a terminal, say)
+            return {**out, "account": acct, "what": os.path.basename(s.get("cwd") or "") or "Claude Code"}
+        acct, local, title = hit
+        return {**out, "account": acct, "url": "claude://code/continue?session=%s" % local,
+                "what": title or os.path.basename(s.get("cwd") or "") or "Claude Code"}
+
     # ---- talking to the board ----
     def update(self, force=False):
         with self.lock:
@@ -1408,6 +1554,7 @@ class Buddy:
     def event(self, name):
         # an event plays in its home mood (oops: working, hello: idle); the board walks
         # there by itself, so re-assert our mood once it has finished
+        self.last_anim = {"name": name, "n": self.last_anim["n"] + 1, "t": time.time()}   # GET /status, for the Mac Lump
         if self.dev.send("e " + name):
             self.resync_at = time.time() + 8
             return True
@@ -1453,7 +1600,8 @@ class Buddy:
             mood = self.mood_locked(now)
             ev = self.last_event_anim
             playing = {"name": ev["name"], "age": round(now - ev["at"], 2)} if ev and 0 <= now - ev["at"] < 30 else None
-            return {"mood": mood, "shown": self.preview or mood, "playing": playing, "sent": self.sent_mood, "counts": self.counts_locked(now), "device": self.dev.connected, "link": getattr(self.dev, "link", None),
+            return {"mood": mood, "shown": self.preview or mood, "playing": playing, "sent": self.sent_mood,
+                    "event": {"name": self.last_anim["name"], "n": self.last_anim["n"], "age_s": round(now - self.last_anim["t"], 1)}, "counts": self.counts_locked(now), "device": self.dev.connected, "link": getattr(self.dev, "link", None),
                     "colour": self.colour(now), "usage": self.usage, "apps": APPS.list(),
                     "sound": bool(self.sounds.settings().get("enabled")),
                     "next_meeting": self.next_meeting(now),
@@ -1592,9 +1740,11 @@ class SlackWatch:
     """Slack, read with your own user token (a private "Desk status" app with read-only user scopes:
     im:read im:history mpim:read mpim:history users:read search:read). Every SLACK_EVERY seconds:
 
-      VIPs ("slack_vips" in config.json, names as Slack shows them): their 1:1 DMs are checked for
-      unread messages. One you haven't read -> Lump holds up a letter until Slack no longer counts it
-      unread (read it anywhere, phone included) or the hold time passes. A newer message re-arms it.
+      VIPs ("slack_vips" in config.json: names as Slack shows them, or user ids): their 1:1 DMs are
+      checked for unread messages. One you haven't read -> Lump holds up a letter until Slack no longer
+      counts it unread (read it anywhere, phone included) or the hold time passes. A newer message
+      re-arms it. A VIP message that @-mentions you (or lands in a group DM with you) is a letter too,
+      put away when Slack shows you've read it (group DMs), when you reply there, or at the hold time.
       Everyone else: a search for messages sent to you (DMs and group DMs) and messages that @-mention
       you by name. Each new one, unless it's yours or a bot's, sends one paper plane.
 
@@ -1610,6 +1760,7 @@ class SlackWatch:
         self.token, self.me, self.users, self.users_at, self.ims, self.ims_at = None, None, {}, 0.0, {}, 0.0
         self.seen = time.time()                        # newest message (Slack ts) already reacted to
         self.unread_once = {}                          # VIP DM -> ts seen unread once while Slack was in front
+        self.no_marker = set()                         # channels whose read marker these scopes can't see
         self.status, self.backoff, self.last_err = "off", 0.0, None
         if start:
             threading.Thread(target=self._run, daemon=True).start()
@@ -1678,19 +1829,21 @@ class SlackWatch:
         if token != self.token:
             self.token, self.me, self.users_at, self.ims_at, self.backoff = token, None, 0.0, 0.0, 0.0
         if not self.me:
-            self.me = self.call("auth.test")["user_id"]
+            who = self.call("auth.test")
+            self.me, self.buddy.slack_team = who["user_id"], who.get("team_id")   # team: for slack:// links (GET /open)
             log.info("slack: connected")
         vip_names = {str(n).strip().lower() for n in cfg.get("slack_vips") or [] if str(n).strip()}
         if now - self.users_at > self.USERS_EVERY:
             self.load_users()
             self.users_at = now
-        vips = {uid for uid, u in self.users.items() if vip_names & u["names"]}
+        vips = {uid for uid, u in self.users.items() if vip_names & u["names"] or uid.lower() in vip_names}
         if now - self.ims_at > self.IMS_EVERY:
             self.load_ims()
             self.ims_at = now
         front = self.slack_in_front()
         self.check_vips(vips, front)
         self.check_new(vips, now, front)
+        self.check_mentions()
         self.status = "ok, %d VIP(s) found of %d named" % (len(vips), len(vip_names))
         self.last_err = None
 
@@ -1743,7 +1896,7 @@ class SlackWatch:
                 self.unread_once.pop(ch, None)
                 if ch in self.buddy.letters:
                     self.buddy.slack_read(ch)
-        for ch in [c for c in self.buddy.letters if c not in watched]:
+        for ch in [c for c, l in self.buddy.letters.items() if l.get("kind", "dm") == "dm" and c not in watched]:
             self.buddy.slack_read(ch)                   # no longer a VIP (or the DM's gone)
 
     def check_new(self, vips, now, front=False):
@@ -1765,6 +1918,9 @@ class SlackWatch:
                 continue
             if uid in vips and ch.get("is_im"):
                 continue                                # a VIP's DM: that's the letter's job
+            if uid in vips and ch.get("id"):            # a VIP tagged you (or wrote in a group DM): a letter too
+                self.buddy.slack_letter("m:" + ch["id"], self.name(uid), m["ts"], kind="mention", channel=ch["id"])
+                continue
             if ch.get("is_im") or ch.get("is_mpim"):
                 kind = "DM"
             plane = plane or (kind, self.name(uid))
@@ -1773,6 +1929,30 @@ class SlackWatch:
             log.info("slack: %s from %s, no plane (you're in Slack)", plane[0], plane[1])
         elif plane:
             self.buddy.slack_plane(plane[1], plane[0])
+
+    def check_mentions(self):
+        """Put away a VIP mention's letter once you've seen it. Your read marker is only visible for group
+        DMs (these scopes can't read channels' markers), so a reply from you there after it counts too.
+        Otherwise it times out like any letter."""
+        pending = {k: l for k, l in list(self.buddy.letters.items()) if l.get("kind") == "mention" and not l.get("expired")}
+        if not pending:
+            return
+        mine = None
+        for key, l in pending.items():
+            ch, ts = l["ch"], float(l["ts"])
+            if ch not in self.no_marker:
+                try:
+                    if float(self.call("conversations.info", channel=ch)["channel"].get("last_read") or 0) >= ts:
+                        self.buddy.slack_read(key); continue
+                except SlackError:
+                    self.no_marker.add(ch)              # a channel: no read marker with these scopes
+            if mine is None:
+                r = self.call("search.messages", query="from:me", sort="timestamp", sort_dir="desc", count=30)
+                mine = [((m.get("channel") or {}).get("id"), float(m.get("ts") or 0))     # your latest messages
+                        for m in (r.get("messages") or {}).get("matches") or []]
+            if any(c == ch and t > ts for c, t in mine):
+                log.info("slack: you replied to %s", l.get("from"))
+                self.buddy.slack_read(key)
 
 
 class AppUsageFile:
@@ -1883,6 +2063,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._reply(200, json.dumps(buddy.sounds.settings(), indent=2).encode(), "application/json")
         elif self.path == "/play":
             self._reply(200, json.dumps(list(ANIMATIONS)).encode(), "application/json")
+        elif self.path == "/open":                # what clicking the Mac Lump should open
+            self._reply(200, json.dumps(buddy.open_target()).encode(), "application/json")
         else:
             self._reply(404)
 

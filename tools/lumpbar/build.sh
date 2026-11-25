@@ -33,8 +33,23 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>Clicking Lump opens the Claude thread he's showing you, in the right Claude window.</string>
 </dict></plist>
 PLIST
-codesign --force --sign - "$APP"
+# Sign with a stable local certificate if there is one (Claude Switcher's), so macOS remembers that
+# Lump may send links to Claude across rebuilds; otherwise ad hoc (macOS asks again after each build).
+SIGNING="$HOME/Library/Application Support/Claude Switcher Signing"
+if [ -f "$SIGNING/signing.keychain-db" ] && [ -f "$SIGNING/password" ]; then
+  KC="$SIGNING/signing.keychain-db"
+  security unlock-keychain -p "$(cat "$SIGNING/password")" "$KC"
+  ID="$(security find-certificate -c "Claude Switcher Local" -Z "$KC" | awk '/SHA-1/ {print $NF}')"
+  OLD_LIST=()
+  while IFS= read -r k; do OLD_LIST+=("$k"); done < <(security list-keychains -d user | sed -E 's/^ *"(.*)"$/\1/')
+  security list-keychains -d user -s "${OLD_LIST[@]}" "$KC"
+  codesign --force --sign "$ID" "$APP" || codesign --force --sign - "$APP"
+  security list-keychains -d user -s "${OLD_LIST[@]}"
+else
+  codesign --force --sign - "$APP"
+fi
 open "$APP"
 echo "Lump is running from $APP"
