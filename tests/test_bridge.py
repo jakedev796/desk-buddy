@@ -449,7 +449,8 @@ class FakeSlack:
         self.ims = {"UBOSS": "DBOSS", "UPAL": "DPAL"}
         self.unread = {"DBOSS": 0, "DPAL": 0}
         self.latest = {"DBOSS": "1.0", "DPAL": "1.0"}
-        self.found = {"to:me": [], "<@UME>": []}
+        self.found = {"to:me": [], "<@UME>": [], "from:me": []}
+        self.marker = {"GGROUP": "0"}                   # group DMs show your read marker; channels (C...) don't
         self.calls = []
 
     def __call__(self, method, **p):
@@ -459,12 +460,15 @@ class FakeSlack:
         if method == "users.conversations": return {"ok": True, "channels": [{"id": c, "user": u} for u, c in self.ims.items()]}
         if method == "conversations.info":
             ch = p["channel"]
+            if ch.startswith("C"): raise bridge.SlackError("missing_scope (needs channels:read)")
+            if ch in self.marker: return {"ok": True, "channel": {"id": ch, "last_read": self.marker[ch]}}
             return {"ok": True, "channel": {"id": ch, "unread_count_display": self.unread[ch], "latest": {"ts": self.latest[ch]}, "last_read": "0"}}
         if method == "search.messages": return {"ok": True, "messages": {"matches": self.found[p["query"]]}}
         raise AssertionError("unexpected call " + method)
 
     def message(self, query, user, ts, ch="DPAL", im=True, **extra):
-        self.found[query].insert(0, {"user": user, "ts": "%.6f" % ts, "channel": {"id": ch, "is_im": im}, "text": "secret words", **extra})
+        self.found[query].insert(0, {"user": user, "ts": "%.6f" % ts, "channel": {"id": ch, "is_im": im, **({"is_mpim": True} if ch.startswith("G") else {})},
+                                     "text": "secret words", **extra})
 
 
 class SlackTest(BridgeTest):
@@ -608,6 +612,53 @@ class SlackTest(BridgeTest):
         self.poll()
         self.assertEqual(self.api.calls, [])
 
+    def test_vip_mention_in_a_channel_is_a_letter_put_away_when_you_reply(self):
+        t = self.clock()
+        self.api.message("<@UME>", "UBOSS", t + 1, ch="CGEN", im=False)
+        self.clock.advance(5); self.poll()
+        self.assertEqual(self.mood(), "letter")
+        self.assertEqual(self.planes(), 0)                 # a VIP's mention is a letter, not a plane
+        self.assertEqual(self.b._relevant_locked(self.clock(), "letter"), ("letter", "CGEN"))   # click opens that channel
+        self.clock.advance(20); self.poll()
+        self.assertEqual(self.mood(), "letter")            # no read marker for channels: still up
+        self.api.message("from:me", "UME", self.clock() - 1, ch="CGEN", im=False)
+        self.poll()
+        self.assertEqual(self.mood(), "idle")              # you replied there: seen
+
+    def test_vip_group_dm_letter_goes_when_slack_shows_it_read(self):
+        t = self.clock()
+        self.api.message("to:me", "UBOSS", t + 1, ch="GGROUP", im=False)
+        self.clock.advance(5); self.poll()
+        self.assertEqual(self.mood(), "letter")
+        self.api.marker["GGROUP"] = "%.6f" % (t + 1)
+        self.poll()
+        self.assertEqual(self.mood(), "idle")
+
+    def test_vip_dm_letters_and_mention_letters_dont_clear_each_other(self):
+        self.api.unread["DBOSS"] = 1
+        self.api.message("<@UME>", "UBOSS", self.clock() + 1, ch="CGEN", im=False)
+        self.clock.advance(5); self.poll()
+        self.assertEqual(sorted(self.b.letters), ["DBOSS", "m:CGEN"])
+        self.api.unread["DBOSS"] = 0
+        self.poll()
+        self.assertEqual(sorted(self.b.letters), ["m:CGEN"])
+        self.assertEqual(self.mood(), "letter")
+
+    def test_vips_can_be_given_as_user_ids(self):
+        with open(bridge.CONFIG_FILE, "w") as f:
+            json.dump({"slack_token": "xoxp-test-token", "slack_vips": ["UBOSS"]}, f)
+        self.api.unread["DBOSS"] = 1
+        self.poll()
+        self.assertEqual(self.mood(), "letter")
+
+    def test_the_plane_is_reported_for_the_mac_lump_even_with_the_board_offline(self):
+        self.b.dev.send = lambda cmd, quiet=False: False
+        before = self.b.status()["event"]["n"]
+        self.api.message("to:me", "UPAL", self.clock() + 1)
+        self.clock.advance(5); self.poll()
+        ev = self.b.status()["event"]
+        self.assertEqual((ev["name"], ev["n"]), ("tap_plane", before + 1))
+
     def test_token_and_message_text_never_reach_the_log(self):
         self.api.message("to:me", "UPAL", self.clock() + 1)
         def boom(method, **p): raise RuntimeError("bad url https://slack.com/api/x token=xoxp-test-token")
@@ -739,6 +790,113 @@ class FocusAcrossAccounts(unittest.TestCase):
             self.assertEqual(self.f._front_account('"CFBundleIdentifier"="com.anthropic.claudefordesktop"\n"pid"=7'), "work")
             self.assertEqual(self.f._front_account('"CFBundleIdentifier"="com.anthropic.claudefordesktop"\n"pid"=8'), "personal")
             self.assertIsNone(self.f._front_account('"CFBundleIdentifier"="com.apple.Terminal"\n"pid"=9'))
+
+
+class OpenOnClick(BridgeTest):
+    """GET /open: clicking the Mac Lump opens whatever he's showing you about."""
+    def setUp(self):
+        super().setUp()
+        self.support = tempfile.mkdtemp(prefix="deskbuddy-support-")
+        p = mock.patch.object(bridge.AppSessions, "SUPPORT", self.support)
+        p.start(); self.addCleanup(p.stop)
+        self.b.app_sessions = bridge.AppSessions()
+        self.code("Claude", "local_alert", "cli-alert", "Fix the login bug")
+        self.code("Claude", "local_busy", "cli-busy", "Lump on the Mac")
+        self.code("Claude-Work", "local_work", "cli-work", "Quarterly numbers")
+
+    def record(self, folder, kind, local, **fields):
+        d = os.path.join(self.support, folder, kind, "acct", "org")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, local + ".json"), "w") as f:
+            json.dump({"sessionId": local, **fields}, f, separators=(",", ":"))
+
+    def code(self, folder, local, cli, title):
+        self.record(folder, "claude-code-sessions", local, cliSessionId=cli, title=title, isArchived=False)
+
+    def opens(self):
+        return self.b.open_target()
+
+    def test_needs_you_opens_the_session_asking(self):
+        self.hook("UserPromptSubmit", "cli-busy")
+        self.clock.advance(5)
+        self.hook("PermissionRequest", "cli-alert")
+        self.assertEqual(self.mood(), "alert")
+        o = self.opens()
+        self.assertEqual(o["url"], "claude://code/continue?session=local_alert")
+        self.assertEqual(o["account"], "personal")
+        self.assertEqual(o["what"], "Fix the login bug")
+
+    def test_working_opens_the_busiest_most_recent_session(self):
+        self.hook("UserPromptSubmit", "cli-alert"); self.hook("Stop", "cli-alert")
+        self.clock.advance(60)
+        self.hook("UserPromptSubmit", "cli-busy")
+        self.assertEqual(self.mood(), "working")
+        self.assertEqual(self.opens()["url"], "claude://code/continue?session=local_busy")
+
+    def test_a_finish_opens_what_just_finished(self):
+        self.hook("UserPromptSubmit", "cli-busy")
+        self.hook("UserPromptSubmit", "cli-alert"); self.hook("Stop", "cli-alert")
+        self.assertEqual(self.mood(), "done")
+        self.assertEqual(self.opens()["url"], "claude://code/continue?session=local_alert")
+
+    def test_unread_result_opens_it(self):
+        self.hook("UserPromptSubmit", "cli-alert"); self.hook("Stop", "cli-alert")
+        self.clock.advance(60)                                  # past the celebration
+        self.assertEqual(self.mood(), "awake")
+        self.assertEqual(self.opens()["url"], "claude://code/continue?session=local_alert")
+
+    def test_work_sessions_go_to_the_work_copy(self):
+        self.hook("PermissionRequest", "cli-work", transcript_path=WORK_TRANSCRIPT)
+        o = self.opens()
+        self.assertEqual(o["url"], "claude://code/continue?session=local_work")
+        self.assertEqual(o["account"], "work")
+
+    def test_a_cowork_task_is_found_by_its_title(self):
+        self.record("Claude-Work", "local-agent-mode-sessions", "local_task", title="For random bet forgiveness, check the rules", lastActivityAt=5)
+        self.b.external("app:work:For random bet forgiveness,…", "alert", account="work")
+        o = self.opens()
+        self.assertEqual(o["url"], "claude://claude.ai/cowork/local_task")
+        self.assertEqual(o["account"], "work")
+
+    def test_a_chat_without_an_id_just_brings_its_copy_forward(self):
+        self.b.external("app:work:Plans", "alert", account="work")
+        o = self.opens()
+        self.assertIsNone(o["url"])
+        self.assertEqual(o["account"], "work")
+
+    def test_a_terminal_session_has_no_app_link(self):
+        self.hook("PermissionRequest", "cli-from-terminal")
+        self.assertIsNone(self.opens()["url"])
+
+    def test_a_vip_letter_opens_that_slack_dm(self):
+        self.b.slack_team = "T1"
+        self.b.slack_letter("D123", "Sam", "1.0")
+        self.assertEqual(self.mood(), "letter")
+        self.assertEqual(self.opens()["url"], "slack://channel?team=T1&id=D123")
+
+    def test_meeting_time_opens_the_call(self):
+        with open(bridge.MEETINGS_FILE, "w") as f:
+            json.dump([{"start": NOON - 5, "end": NOON + 1800, "title": "Standup", "url": "https://meet.google.com/abc-defg-hij"}], f)
+        self.assertEqual(self.mood(), "meeting")
+        o = self.opens()
+        self.assertEqual(o["url"], "https://meet.google.com/abc-defg-hij")
+        self.assertEqual(o["what"], "Standup")
+
+    def test_asleep_opens_where_you_left_off(self):
+        self.hook("SessionStart", "cli-busy")
+        self.clock.advance(60)
+        self.hook("SessionStart", "cli-alert")
+        self.clock.advance(3600)
+        self.assertEqual(self.mood(), "idle")
+        self.assertEqual(self.opens()["url"], "claude://code/continue?session=local_alert")
+
+
+class MeetingLinks(unittest.TestCase):
+    def test_the_join_link_is_found_in_the_invite(self):
+        self.assertEqual(bridge.meeting_link({"X-GOOGLE-CONFERENCE": "https://meet.google.com/abc-defg-hij"}), "https://meet.google.com/abc-defg-hij")
+        self.assertEqual(bridge.meeting_link({"LOCATION": "Room 4", "DESCRIPTION": "Join: https://acme.zoom.us/j/123?pwd=x.\nThanks"}), "https://acme.zoom.us/j/123?pwd=x")
+        self.assertEqual(bridge.meeting_link({"LOCATION": "https://example.com/room"}), "https://example.com/room")
+        self.assertIsNone(bridge.meeting_link({"LOCATION": "Room 4", "DESCRIPTION": "see https://docs.example.com/agenda"}))
 
 
 if __name__ == "__main__":
