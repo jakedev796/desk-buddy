@@ -72,7 +72,7 @@ TAP_SNOOZE = 120                        # tapping "needs you" holds off the nagg
 # (at night the startle, before a meeting the prep), but without a tap's meaning: nothing is snoozed
 # or silenced. A named gag plays in whatever mood he's in.
 GAGS = ("shock", "moto", "wolf", "accordion", "anvil", "disco", "glass", "banana", "balloon", "sneeze", "moon", "bomb")
-ANIMATIONS = {"tap": "tap", **{g: f"tap_{g}" for g in GAGS}, "startle": "tap_startle_night", "prep": "tap_prep",
+ANIMATIONS = {"tap": "tap", **{g: f"tap_{g}" for g in GAGS}, "startle": "tap_startle_night", "prep": "tap_prep", "plane": "tap_plane",
               **{e: e for e in ("fidget_toss", "fidget_twitch", "fidget_bubble", "oops", "hello")}}
 # Usage gauge: his colour warms from Tangerine to red as the busier of your 5-hour / weekly
 # Claude limits fills up (fed by the Claude Code status line, see tools/statusline.sh).
@@ -721,6 +721,7 @@ class Buddy:
         self.slack_team = None                    # your Slack workspace id, for slack:// links
         self.app_sessions = AppSessions()         # the Claude app's own session ids, for GET /open
         self.last_plane = 0.0
+        self.last_anim = {"name": None, "n": 0, "t": 0.0}   # the last one-off animation asked for (see event())
         self.load_state()
         self.dev = dev or Device(self.resend, self.board_line)
         if start:
@@ -861,14 +862,16 @@ class Buddy:
                 l["expired"] = True
         return {ch: l for ch, l in self.letters.items() if not l.get("expired")}
 
-    def slack_letter(self, ch, sender, ts):
-        """An unread DM from a VIP (ts: Slack's id for the newest one). He holds up a letter."""
+    def slack_letter(self, ch, sender, ts, kind="dm", channel=None):
+        """A VIP wrote to you (ts: Slack's id for the newest message). He holds up a letter.
+        kind "dm": an unread 1:1 DM, keyed by its channel. kind "mention": a message that tags you in a
+        channel or group DM, keyed "m:<channel>" (one letter per conversation, the newest message wins)."""
         with self.lock:
             if (self.letters.get(ch) or {}).get("ts") == ts:
                 return False
             new = ch not in self.letters_locked(time.time())
-            self.letters[ch] = {"from": sender, "ts": ts, "since": time.time()}
-        log.info("slack: letter from %s", sender)
+            self.letters[ch] = {"from": sender, "ts": ts, "since": time.time(), "kind": kind, "ch": channel or ch}
+        log.info("slack: letter from %s (%s)", sender, kind)
         if new:
             self.sound("slack_vip")
         self.update()
@@ -1056,7 +1059,8 @@ class Buddy:
         if mood == "letter":
             letters = self.letters_locked(now)
             if letters:
-                return ("letter", max(letters, key=lambda ch: letters[ch]["since"]))
+                newest = max(letters.values(), key=lambda l: l["since"])
+                return ("letter", newest.get("ch"))
         def newest(pred, key=lambda s: s["t"]):
             hits = [(sid, s) for sid, s in self.sessions.items() if pred(s)]
             return max(hits, key=lambda kv: key(kv[1])) if hits else None
@@ -1216,6 +1220,7 @@ class Buddy:
     def event(self, name):
         # an event plays in its home mood (oops: working, hello: idle); the board walks
         # there by itself, so re-assert our mood once it has finished
+        self.last_anim = {"name": name, "n": self.last_anim["n"] + 1, "t": time.time()}   # GET /status, for the Mac Lump
         if self.dev.send("e " + name):
             self.resync_at = time.time() + 8
             return True
@@ -1256,7 +1261,8 @@ class Buddy:
         with self.lock:
             now = time.time()
             app = getattr(self, "app", None)
-            return {"mood": self.mood_locked(now), "sent": self.sent_mood, "counts": self.counts_locked(now), "device": self.dev.connected, "link": getattr(self.dev, "link", None),
+            return {"mood": self.mood_locked(now), "sent": self.sent_mood,
+                    "event": {"name": self.last_anim["name"], "n": self.last_anim["n"], "age_s": round(now - self.last_anim["t"], 1)}, "counts": self.counts_locked(now), "device": self.dev.connected, "link": getattr(self.dev, "link", None),
                     "colour": self.colour(now), "usage": self.usage,
                     "sound": bool(self.sounds.settings().get("enabled")),
                     "next_meeting": self.next_meeting(now),
@@ -1395,9 +1401,11 @@ class SlackWatch:
     """Slack, read with your own user token (a private "Desk status" app with read-only user scopes:
     im:read im:history mpim:read mpim:history users:read search:read). Every SLACK_EVERY seconds:
 
-      VIPs ("slack_vips" in config.json, names as Slack shows them): their 1:1 DMs are checked for
-      unread messages. One you haven't read -> Lump holds up a letter until Slack no longer counts it
-      unread (read it anywhere, phone included) or the hold time passes. A newer message re-arms it.
+      VIPs ("slack_vips" in config.json: names as Slack shows them, or user ids): their 1:1 DMs are
+      checked for unread messages. One you haven't read -> Lump holds up a letter until Slack no longer
+      counts it unread (read it anywhere, phone included) or the hold time passes. A newer message
+      re-arms it. A VIP message that @-mentions you (or lands in a group DM with you) is a letter too,
+      put away when Slack shows you've read it (group DMs), when you reply there, or at the hold time.
       Everyone else: a search for messages sent to you (DMs and group DMs) and messages that @-mention
       you by name. Each new one, unless it's yours or a bot's, sends one paper plane.
 
@@ -1413,6 +1421,7 @@ class SlackWatch:
         self.token, self.me, self.users, self.users_at, self.ims, self.ims_at = None, None, {}, 0.0, {}, 0.0
         self.seen = time.time()                        # newest message (Slack ts) already reacted to
         self.unread_once = {}                          # VIP DM -> ts seen unread once while Slack was in front
+        self.no_marker = set()                         # channels whose read marker these scopes can't see
         self.status, self.backoff, self.last_err = "off", 0.0, None
         if start:
             threading.Thread(target=self._run, daemon=True).start()
@@ -1486,13 +1495,14 @@ class SlackWatch:
         if now - self.users_at > self.USERS_EVERY:
             self.load_users()
             self.users_at = now
-        vips = {uid for uid, u in self.users.items() if vip_names & u["names"]}
+        vips = {uid for uid, u in self.users.items() if vip_names & u["names"] or uid.lower() in vip_names}
         if now - self.ims_at > self.IMS_EVERY:
             self.load_ims()
             self.ims_at = now
         front = self.slack_in_front()
         self.check_vips(vips, front)
         self.check_new(vips, now, front)
+        self.check_mentions()
         self.status = "ok, %d VIP(s) found of %d named" % (len(vips), len(vip_names))
         self.last_err = None
 
@@ -1545,7 +1555,7 @@ class SlackWatch:
                 self.unread_once.pop(ch, None)
                 if ch in self.buddy.letters:
                     self.buddy.slack_read(ch)
-        for ch in [c for c in self.buddy.letters if c not in watched]:
+        for ch in [c for c, l in self.buddy.letters.items() if l.get("kind", "dm") == "dm" and c not in watched]:
             self.buddy.slack_read(ch)                   # no longer a VIP (or the DM's gone)
 
     def check_new(self, vips, now, front=False):
@@ -1567,6 +1577,9 @@ class SlackWatch:
                 continue
             if uid in vips and ch.get("is_im"):
                 continue                                # a VIP's DM: that's the letter's job
+            if uid in vips and ch.get("id"):            # a VIP tagged you (or wrote in a group DM): a letter too
+                self.buddy.slack_letter("m:" + ch["id"], self.name(uid), m["ts"], kind="mention", channel=ch["id"])
+                continue
             if ch.get("is_im") or ch.get("is_mpim"):
                 kind = "DM"
             plane = plane or (kind, self.name(uid))
@@ -1575,6 +1588,30 @@ class SlackWatch:
             log.info("slack: %s from %s, no plane (you're in Slack)", plane[0], plane[1])
         elif plane:
             self.buddy.slack_plane(plane[1], plane[0])
+
+    def check_mentions(self):
+        """Put away a VIP mention's letter once you've seen it. Your read marker is only visible for group
+        DMs (these scopes can't read channels' markers), so a reply from you there after it counts too.
+        Otherwise it times out like any letter."""
+        pending = {k: l for k, l in list(self.buddy.letters.items()) if l.get("kind") == "mention" and not l.get("expired")}
+        if not pending:
+            return
+        mine = None
+        for key, l in pending.items():
+            ch, ts = l["ch"], float(l["ts"])
+            if ch not in self.no_marker:
+                try:
+                    if float(self.call("conversations.info", channel=ch)["channel"].get("last_read") or 0) >= ts:
+                        self.buddy.slack_read(key); continue
+                except SlackError:
+                    self.no_marker.add(ch)              # a channel: no read marker with these scopes
+            if mine is None:
+                r = self.call("search.messages", query="from:me", sort="timestamp", sort_dir="desc", count=30)
+                mine = [((m.get("channel") or {}).get("id"), float(m.get("ts") or 0))     # your latest messages
+                        for m in (r.get("messages") or {}).get("matches") or []]
+            if any(c == ch and t > ts for c, t in mine):
+                log.info("slack: you replied to %s", l.get("from"))
+                self.buddy.slack_read(key)
 
 
 buddy = None

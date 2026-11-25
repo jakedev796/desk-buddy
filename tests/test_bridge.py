@@ -432,7 +432,8 @@ class FakeSlack:
         self.ims = {"UBOSS": "DBOSS", "UPAL": "DPAL"}
         self.unread = {"DBOSS": 0, "DPAL": 0}
         self.latest = {"DBOSS": "1.0", "DPAL": "1.0"}
-        self.found = {"to:me": [], "<@UME>": []}
+        self.found = {"to:me": [], "<@UME>": [], "from:me": []}
+        self.marker = {"GGROUP": "0"}                   # group DMs show your read marker; channels (C...) don't
         self.calls = []
 
     def __call__(self, method, **p):
@@ -442,12 +443,15 @@ class FakeSlack:
         if method == "users.conversations": return {"ok": True, "channels": [{"id": c, "user": u} for u, c in self.ims.items()]}
         if method == "conversations.info":
             ch = p["channel"]
+            if ch.startswith("C"): raise bridge.SlackError("missing_scope (needs channels:read)")
+            if ch in self.marker: return {"ok": True, "channel": {"id": ch, "last_read": self.marker[ch]}}
             return {"ok": True, "channel": {"id": ch, "unread_count_display": self.unread[ch], "latest": {"ts": self.latest[ch]}, "last_read": "0"}}
         if method == "search.messages": return {"ok": True, "messages": {"matches": self.found[p["query"]]}}
         raise AssertionError("unexpected call " + method)
 
     def message(self, query, user, ts, ch="DPAL", im=True, **extra):
-        self.found[query].insert(0, {"user": user, "ts": "%.6f" % ts, "channel": {"id": ch, "is_im": im}, "text": "secret words", **extra})
+        self.found[query].insert(0, {"user": user, "ts": "%.6f" % ts, "channel": {"id": ch, "is_im": im, **({"is_mpim": True} if ch.startswith("G") else {})},
+                                     "text": "secret words", **extra})
 
 
 class SlackTest(BridgeTest):
@@ -590,6 +594,53 @@ class SlackTest(BridgeTest):
             json.dump({}, f)
         self.poll()
         self.assertEqual(self.api.calls, [])
+
+    def test_vip_mention_in_a_channel_is_a_letter_put_away_when_you_reply(self):
+        t = self.clock()
+        self.api.message("<@UME>", "UBOSS", t + 1, ch="CGEN", im=False)
+        self.clock.advance(5); self.poll()
+        self.assertEqual(self.mood(), "letter")
+        self.assertEqual(self.planes(), 0)                 # a VIP's mention is a letter, not a plane
+        self.assertEqual(self.b._relevant_locked(self.clock(), "letter"), ("letter", "CGEN"))   # click opens that channel
+        self.clock.advance(20); self.poll()
+        self.assertEqual(self.mood(), "letter")            # no read marker for channels: still up
+        self.api.message("from:me", "UME", self.clock() - 1, ch="CGEN", im=False)
+        self.poll()
+        self.assertEqual(self.mood(), "idle")              # you replied there: seen
+
+    def test_vip_group_dm_letter_goes_when_slack_shows_it_read(self):
+        t = self.clock()
+        self.api.message("to:me", "UBOSS", t + 1, ch="GGROUP", im=False)
+        self.clock.advance(5); self.poll()
+        self.assertEqual(self.mood(), "letter")
+        self.api.marker["GGROUP"] = "%.6f" % (t + 1)
+        self.poll()
+        self.assertEqual(self.mood(), "idle")
+
+    def test_vip_dm_letters_and_mention_letters_dont_clear_each_other(self):
+        self.api.unread["DBOSS"] = 1
+        self.api.message("<@UME>", "UBOSS", self.clock() + 1, ch="CGEN", im=False)
+        self.clock.advance(5); self.poll()
+        self.assertEqual(sorted(self.b.letters), ["DBOSS", "m:CGEN"])
+        self.api.unread["DBOSS"] = 0
+        self.poll()
+        self.assertEqual(sorted(self.b.letters), ["m:CGEN"])
+        self.assertEqual(self.mood(), "letter")
+
+    def test_vips_can_be_given_as_user_ids(self):
+        with open(bridge.CONFIG_FILE, "w") as f:
+            json.dump({"slack_token": "xoxp-test-token", "slack_vips": ["UBOSS"]}, f)
+        self.api.unread["DBOSS"] = 1
+        self.poll()
+        self.assertEqual(self.mood(), "letter")
+
+    def test_the_plane_is_reported_for_the_mac_lump_even_with_the_board_offline(self):
+        self.b.dev.send = lambda cmd, quiet=False: False
+        before = self.b.status()["event"]["n"]
+        self.api.message("to:me", "UPAL", self.clock() + 1)
+        self.clock.advance(5); self.poll()
+        ev = self.b.status()["event"]
+        self.assertEqual((ev["name"], ev["n"]), ("tap_plane", before + 1))
 
     def test_token_and_message_text_never_reach_the_log(self):
         self.api.message("to:me", "UPAL", self.clock() + 1)
