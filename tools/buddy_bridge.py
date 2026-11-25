@@ -522,6 +522,8 @@ class Focus:
     showing) doesn't, so it's put down to the copy in front, or the one that was in front last."""
 
     LOGS = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Claude", "logs") if IS_WIN else os.path.expanduser("~/Library/Logs/Claude")
+    WIN_LOG_DIRS = [os.path.join(os.environ.get("APPDATA", ""), "Claude", "logs"),
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Packages", "Claude_*", "LocalCache", "Roaming", "Claude", "logs")]
     SUPPORT = APP_SUPPORT                 # Claude/ (personal), Claude-Work/ ... each with claude-code-sessions/
     FOCUS_RE = re.compile(r"setFocusedSession: sessionId=(local_[0-9a-f-]+|null)")
 
@@ -583,7 +585,10 @@ class Focus:
         return self._pids[pid] or PERSONAL
 
     def _poll_log(self):
-        logs = sorted(glob.glob(os.path.join(self.LOGS, "main*.log")), key=os.path.getmtime)
+        # Windows: the app's logs are documented under %APPDATA%\Claude\logs but have been seen under
+        # %LOCALAPPDATA%\Claude\logs: look in both (and in the Store/MSIX app's redirected folder), newest wins
+        dirs = [self.LOGS] + (self.WIN_LOG_DIRS if IS_WIN else [])
+        logs = sorted({p for d in dirs for p in glob.glob(os.path.join(d, "main*.log"))}, key=os.path.getmtime)
         if not logs: return
         if logs[-1] != self._log:                    # first run or the app rotated its log
             self._log = logs[-1]

@@ -55,7 +55,9 @@ def windows_posix_tz():
                         ("DaylightBias", wintypes.LONG)]
 
         tzi = TZI()
-        if ctypes.windll.kernel32.GetTimeZoneInformation(ctypes.byref(tzi)) == 0xFFFFFFFF:
+        get = ctypes.windll.kernel32.GetTimeZoneInformation
+        get.restype = wintypes.DWORD                   # unsigned, so the failure value really is 0xFFFFFFFF
+        if get(ctypes.byref(tzi)) == 0xFFFFFFFF:
             return ""
         d = lambda t: (t.wMonth, t.wDay, t.wDayOfWeek, t.wHour)
         return posix_tz_from_windows(tzi.Bias, tzi.StandardBias, tzi.DaylightBias, d(tzi.StandardDate), d(tzi.DaylightDate))
@@ -79,7 +81,9 @@ def posix_tz():
 def current_ssid():
     if IS_WIN:
         try:
-            out = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True, timeout=3).stdout
+            # netsh writes in the console's OEM code page (cp850 on a German Windows): "Büro-WLAN" stays intact
+            out = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, timeout=3,
+                                 encoding="oem", errors="replace").stdout
             m = re.search(r"^\s*SSID\s*: (.+)$", out, re.M)
             return m.group(1).strip() if m else ""
         except Exception:

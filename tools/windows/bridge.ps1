@@ -6,6 +6,7 @@ param([switch]$Start, [switch]$Stop, [switch]$Status)
 
 $RT = Join-Path $HOME ".desk-buddy"
 $Shortcut = Join-Path ([Environment]::GetFolderPath("Startup")) "Desk Buddy bridge.lnk"
+$StartupCmd = Join-Path ([Environment]::GetFolderPath("Startup")) "Desk Buddy bridge.cmd"   # install.ps1's fallback
 $Pythonw = Join-Path $RT "venv\Scripts\pythonw.exe"
 
 function Get-BridgeProcesses {
@@ -27,7 +28,7 @@ if ($Stop) {
 }
 
 if ($Start) {
-    if (-not (Test-Path $Shortcut) -or -not (Test-Path $Pythonw)) {
+    if (-not ((Test-Path $Shortcut) -or (Test-Path $StartupCmd)) -or -not (Test-Path $Pythonw)) {
         Write-Output "bridge not installed (tools\windows\install.ps1)"
     } elseif (Get-BridgeProcesses | Where-Object { $_.CommandLine -match 'keepalive' }) {
         Write-Output "bridge already running"

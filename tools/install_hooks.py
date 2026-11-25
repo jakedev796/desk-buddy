@@ -9,9 +9,14 @@ JSON to the bridge on 127.0.0.1:47823 and never blocks or fails Claude Code. It 
 status line (tools/statusline.sh, which feeds your usage limits to his colour) unless you already
 have a status line of your own. Running it again changes nothing; settings.json is backed up first.
 
-On Windows the hooks are the very same entries (Claude Code runs them in Git Bash, which has curl), so a
-settings.json shared between a Mac and Windows machines stays valid on both. Only the status line differs:
-tools/statusline.py, run by the Python that ran this script, written with plain absolute paths.
+On Windows Claude Code runs a hook's command in Git Bash, but in PowerShell when Git for Windows isn't
+installed, and there the Mac's `curl ... || true` fails (`||` is a parse error in Windows PowerShell, `curl` is
+Invoke-WebRequest), silently, since the hooks are async. So on Windows the hook is written in exec form
+(`command` + `args`): Claude Code starts curl itself, no shell involved, the same with or without Git Bash.
+That form runs on a Mac too, so a settings.json shared between Mac and Windows stays valid on both.
+--noproxy: a proxy in HTTP(S)_PROXY must never see these local posts. The status line differs too:
+tools/statusline.py, run by the Python that ran this script (run it with the bridge's own,
+~/.desk-buddy/venv/Scripts/python.exe, so the status line survives a Python upgrade).
 """
 import argparse, json, os, shutil, sys, time
 
@@ -21,6 +26,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNTIME = os.path.expanduser("~/.desk-buddy")
 HOOK_CMD = ("curl -s -m 1 -o /dev/null -H 'Content-Type: application/json' "
             "--data-binary @- http://127.0.0.1:47823/hook || true")
+# Windows: exec form, no shell (see the docstring). Without -o the bridge's "ok" goes to stdout, which an
+# async hook's output is: ignored. Windows 10/11 ship curl.exe in System32.
+HOOK_WIN = {"command": "curl.exe",
+            "args": ["-s", "-m", "1", "--noproxy", "*", "-H", "Content-Type: application/json",
+                     "--data-binary", "@-", "http://127.0.0.1:47823/hook"]}
 # events without a tool name take no matcher
 EVENTS = {"SessionStart": "*", "UserPromptSubmit": None, "PreToolUse": "*", "PermissionRequest": "*",
           "PostToolUse": "*", "PostToolUseFailure": "*", "Notification": "*", "Elicitation": "*",
@@ -29,7 +39,8 @@ MARK = "127.0.0.1:47823/"
 
 
 def ours(group):
-    return any(MARK in (h.get("command") or "") or MARK in (h.get("url") or "") for h in group.get("hooks", []))
+    return any(MARK in (h.get("command") or "") or MARK in (h.get("url") or "")
+               or any(MARK in str(a) for a in (h.get("args") or [])) for h in group.get("hooks", []))
 
 
 def windows_status_command(status_py):
@@ -75,7 +86,8 @@ def main():
                 if kept: hooks[event] = kept
                 else: hooks.pop(event, None)
         elif not any(ours(g) for g in groups):
-            group = {"hooks": [{"type": "command", "command": HOOK_CMD, "async": True, "timeout": 5}]}
+            hook = {"type": "command", **(HOOK_WIN if IS_WIN else {"command": HOOK_CMD}), "async": True, "timeout": 5}
+            group = {"hooks": [hook]}
             if matcher: group = {"matcher": matcher, **group}
             hooks[event] = groups + [group]
             changed.append(event)

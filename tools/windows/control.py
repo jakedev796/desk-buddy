@@ -15,7 +15,7 @@ tools/windows/install.ps1 installs it as ~/.desk-buddy/control.py and starts it 
 console). Run by hand: ~/.desk-buddy/venv/Scripts/pythonw tools/windows/control.py [--show]
 Needs pywebview, pystray and Pillow (installed by install.ps1).
 """
-import json, os, socket, subprocess, sys, threading, time, urllib.error, urllib.request
+import json, os, socket, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request
 
 HOME = os.environ.get("DESKBUDDY_HOME") or os.path.expanduser("~/.desk-buddy")
 CONFIG_FILE = os.path.join(HOME, "config.json")
@@ -33,12 +33,14 @@ class Bridge:
 
     def __init__(self, url=BRIDGE_URL, timeout=2):
         self.url, self.timeout = url, timeout
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def _call(self, path, body=None):
         req = urllib.request.Request(self.url + path, data=None if body is None else body.encode("utf-8"),
                                      method="GET" if body is None else "POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            # no proxy: urlopen would use the system proxy even for 127.0.0.1 (see statusline.py)
+            with self._opener.open(req, timeout=self.timeout) as r:
                 return r.status, r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", "replace")
@@ -83,9 +85,18 @@ def read_json(path):
         return {}
 
 
+_json_lock = threading.Lock()
+
+
 def update_json(path, changes, remove=()):
     """Merge changes into a JSON file (keeping every other key) and write it atomically.
-    Keys in `remove`, or with a value of None or "", are deleted."""
+    Keys in `remove`, or with a value of None or "", are deleted. One writer at a time (pywebview runs each
+    page call on its own thread), through a temp file of its own (the bridge writes sounds.json.tmp too)."""
+    with _json_lock:
+        return _update_json(path, changes, remove)
+
+
+def _update_json(path, changes, remove):
     data = read_json(path)
     for k, v in changes.items():
         if v is None or v == "":
@@ -95,11 +106,22 @@ def update_json(path, changes, remove=()):
     for k in remove:
         data.pop(k, None)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".control.tmp", dir=os.path.dirname(path))
+    try:
+        with open(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        for attempt in range(10):            # Windows: the bridge or a virus scanner may have it open right now
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return data
 
 

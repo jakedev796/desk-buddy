@@ -337,7 +337,10 @@ class WindowsInstallHooks(unittest.TestCase):
         run_install_hooks(self.home, "--config-dir", self.cfg)
         s = self.read()
         self.assertEqual(len(s["hooks"]["Stop"]), 2)
-        self.assertEqual(s["hooks"]["Stop"][1]["hooks"][0]["command"], self.mac_hook())
+        hook = s["hooks"]["Stop"][1]["hooks"][0]
+        self.assertEqual(hook["command"], "curl.exe")                     # exec form: no shell, Git Bash or not
+        self.assertIn("http://127.0.0.1:47823/hook", hook["args"])
+        self.assertTrue(hook["async"])
         self.assertRegex(s["statusLine"]["command"], r"^\S+\.exe -I \S+/\.desk-buddy/statusline\.py$")
         self.assertNotIn("\\", s["statusLine"]["command"])
         self.assertTrue(os.path.exists(os.path.join(self.home, ".desk-buddy", "statusline.py")))

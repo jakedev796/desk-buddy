@@ -22,6 +22,15 @@ if (-not (Test-Path $Python)) {
     if (Get-Command py -ErrorAction SilentlyContinue) { Invoke-Checked "py" @("-3", "-m", "venv", $Venv) }
     else { Invoke-Checked "python" @("-m", "venv", $Venv) }
 }
+# Behind a corporate network that inspects HTTPS, pip and PlatformIO don't know the company's root
+# certificate (Windows does). Give them Windows' trust list for this run (see ca_bundle.py).
+function Use-WindowsCertificates([string]$Py) {
+    $ca = Join-Path (Join-Path $HOME ".desk-buddy") "windows-ca.pem"
+    & $Py -I (Join-Path $PSScriptRoot "ca_bundle.py") $ca
+    if (-not $LASTEXITCODE) { $env:PIP_CERT = $ca; $env:REQUESTS_CA_BUNDLE = $ca; $env:SSL_CERT_FILE = $ca }
+}
+
+Use-WindowsCertificates $Python                # also for PlatformIO's downloads of the ESP32 tools below
 if (-not (Test-Path (Join-Path $Venv "Scripts\pio.exe"))) {
     Invoke-Checked $Python @("-m", "pip", "-q", "install", "--disable-pip-version-check", "platformio", "esptool", "pyserial")
 }

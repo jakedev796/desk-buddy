@@ -27,7 +27,8 @@ def request(ip, token, path, data=None, headers=None, timeout=10):
     h = {"X-Lump-Token": token, **(headers or {})}
     req = urllib.request.Request(f"http://{ip}{path}", data=data, headers=h, method="POST" if data is not None else "GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        # straight to the board: a system proxy (Windows uses the registry's even for lump.local) would get the token
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as r:
             return r.status, r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode(errors="replace")

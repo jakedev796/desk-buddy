@@ -104,11 +104,14 @@ shortcut in your Startup folder (no admin rights needed; it shows under Task Man
 powershell -ExecutionPolicy Bypass -File tools\windows\install.ps1
 ```
 
-**3. Hook up Claude Code.** The same hooks as on the Mac, so a `settings.json` you share between machines
-stays valid on all of them. Works for Claude Code in the terminal and in the Claude desktop app's Code tab.
+**3. Hook up Claude Code.** The hooks start `curl.exe` directly, without a shell, so they work whether Claude
+Code runs them in Git Bash or, without Git for Windows, in PowerShell (that form works on a Mac too, so a
+`settings.json` you share between machines stays valid on all of them). Works for Claude Code in the terminal
+and in the Claude desktop app's Code tab. Run it with the bridge's own Python, so the status line keeps working
+when you upgrade or remove your system Python:
 
 ```powershell
-python tools\install_hooks.py
+~\.desk-buddy\venv\Scripts\python tools\install_hooks.py
 ```
 
 **4. Optional: Wi-Fi** (cable still plugged in, 2.4 GHz only), then over-the-air updates:
@@ -128,7 +131,7 @@ settings files, so changes apply straight away.
 
 How it differs from the Mac: his usage colour also follows the desktop app (which has no status line) by
 reading its own usage history, sounds play through Windows, and Chat and Cowork states aren't tracked
-yet (Code sessions are). `tools\windows\bridge.ps1 -Status | -Stop | -Start` checks or restarts the bridge;
+yet (Code sessions are). `powershell -ExecutionPolicy Bypass -File tools\windows\bridge.ps1 -Status` (or `-Stop`, `-Start`) checks or restarts the bridge;
 its log is `~\.desk-buddy\bridge.log`.
 
 ### Optional extras

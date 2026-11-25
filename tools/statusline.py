@@ -13,7 +13,9 @@ URL = os.environ.get("DESKBUDDY_USAGE_URL") or "http://127.0.0.1:47823/usage"   
 def forward(raw):
     try:
         req = urllib.request.Request(URL, data=raw, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=1).close()
+        # no proxy: on Windows urlopen would otherwise use the system proxy (registry or HTTP_PROXY) even for
+        # 127.0.0.1, and a corporate proxy would get this session's JSON (and the post would never arrive)
+        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=1).close()
     except Exception:
         pass                                  # bridge not running: the status line still prints
 
